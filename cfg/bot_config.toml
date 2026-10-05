@@ -1,0 +1,40 @@
+# Как сортировать бойцов. Сортирует сама игра, бот берёт первую карточку:
+#   lowest_trophies  - Least Trophies (было единственное)
+#   lowest_level    - Power Level (low to high)
+#   closest_to_rank - Closest to Next Tier
+#   most_trophies   - Most Trophies
+#   by_name         - Name
+minimum_movement_delay = 0.1
+unstuck_movement_delay = 2.4
+unstuck_movement_hold_time = 1.4
+perceived_tile_size = 54
+wall_model_classes = [ "wall", "bush", "close_bush",]
+gadget_pixels_minimum = 1300.0
+hypercharge_pixels_minimum = 1800.0
+super_pixels_minimum = 1800.0
+idle_pixels_minimum = 75000.0
+centered_wall_detection = false
+wall_detection_confidence = 0.6
+entity_detection_confidence = 0.55
+state_detection_confidence = 0.75
+seconds_to_hold_attack_after_reaching_max = 1.5
+play_again_on_win = "no"
+current_playstyle = "showdown_survivor.xlambot"
+gas_model = "models/gasDetector.onnx"
+gas_classes = [ "gas", "bush",]
+gas_avoidance = "yes"
+gas_confidence = 0.25
+gas_sensitivity = 0.05
+gas_reach = 3.0
+gas_lookahead = 4.0
+gas_detect_interval = 0.2
+gas_memory_ttl = 0.6
+gas_area_top = 0.21
+gas_area_bottom = 1.0
+brawler_switch_after_games = 7
+brawler_rotation = ""
+gas_danger_enter = 0.14
+gas_danger_exit = 0.05
+gas_centre_bias = 0.06
+target_trophies = 1000
+brawler_pick_mode = "lowest_trophies"
