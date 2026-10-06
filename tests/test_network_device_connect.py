@@ -1,5 +1,12 @@
 from types import SimpleNamespace
+import pytest
 import webui.device_manager as manager
+from adb_connection import AdbAutoConnector
+
+
+@pytest.fixture(autouse=True)
+def isolated_connections(monkeypatch, tmp_path):
+    monkeypatch.setattr(manager, 'AUTO_CONNECTOR', AdbAutoConnector(tmp_path/'adb.json'))
 
 
 def test_adb_text_reply_is_resolved_to_online_device(monkeypatch):

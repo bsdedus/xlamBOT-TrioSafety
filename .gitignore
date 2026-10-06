@@ -53,6 +53,7 @@ match_audit*.jsonl
 devices/
 latest_brawler_data.json
 account_state.json
+adb_connections.json
 
 # данные для переобучения моделей, для запуска не нужны
 gas_dataset/

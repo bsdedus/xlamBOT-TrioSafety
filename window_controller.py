@@ -1,13 +1,12 @@
 import atexit
 import math
 import random
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 
 import scrcpy
 from adbutils import AdbDevice
-from adb_connection import BoundedAdbClient, foreground_package
+from adb_connection import AUTO_CONNECTOR, BoundedAdbClient, foreground_package, canonical_device_serial, unique_devices
 from debug_view import DebugViewPublisher
 from utils import config_bool, load_toml_as_dict, save_dict_as_toml, invalidate_toml_cache
 
@@ -67,11 +66,12 @@ def restart_adb_server() -> None:
 
 def online_devices():
     out = []
-    for d in adb.device_list():
+    preferred = load_toml_as_dict('cfg/general_config.toml').get('emulator_port')
+    for d in unique_devices(AUTO_CONNECTOR.refresh(adb, adb.device_list(), preferred)):
         try:
             state = d.get_state() if hasattr(d, "get_state") else d.state
         except Exception:
-            state = "device"
+            state = "unknown"
         if state == "device":
             out.append(d)
     return out
@@ -95,7 +95,7 @@ def get_device_by_serial(serial) -> AdbDevice:
 
     wanted_key = wanted.replace(":", "-").lower()
     for device in devices:
-        if device.serial == wanted or device.serial.replace(":", "-").lower() == wanted_key:
+        if device.serial == wanted or device.serial.replace(":", "-").lower() == wanted_key or canonical_device_serial(device.serial) == canonical_device_serial(wanted):
             return device
 
     online = [device.serial for device in devices]
@@ -156,50 +156,16 @@ def adb_device_port_sort_key(device: AdbDevice) -> tuple[float, int, str]:
 
 def discover_device(verbose: bool = False) -> AdbDevice:
     preferred_port = load_toml_as_dict("cfg/general_config.toml").get("emulator_port")
-
-    def _safe_connect(port: int):
-        dev = adb.connect(f"127.0.0.1:{port}")
-        return dev
-
-    if preferred_port:
-        try:
-            port_str = str(preferred_port).strip()
-            if port_str.isdigit():
-                port_num = int(port_str)
-                if verbose:
-                    print(f"Attempting connection to configured preferred port: {port_num}")
-                try:
-                    _safe_connect(port_num)
-                except Exception:
-                    pass
-
-                devices = online_devices()
-                pref = next((d for d in devices if d.serial.endswith(f"{port_str}")), None)
-                if pref:
-                    if verbose:
-                        print(f"Successfully connected to configured preferred port: {pref.serial}")
-                    return pref
-        except Exception as e:
-            if verbose:
-                print(f"Warning: Error handling preferred port connection: {e}")
-
-    candidates = [5137, 5555, 16384, 7555, 5635, 62001, 62025, 62026, 7556, 7565, 16416] + list(range(5556, 5566)) + list(range(5565, 5756, 10)) + list(range(16385, 16415))
-
-    def _try(port):
-        try:
-            _safe_connect(port)
-        except Exception:
-            pass
-
-    with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
-        executor.map(_try, candidates)
-
     devices = online_devices()
+    if preferred_port and str(preferred_port) != '5037':
+        preferred = next((d for d in devices if canonical_device_serial(d.serial) == f'local-adb:{preferred_port}'), None)
+        if preferred:
+            return preferred
     if verbose:
         print(f"Online devices after scan: {[d.serial for d in devices]}")
 
     if not devices:
-        raise ConnectionError("No ADB devices came online after scan.")
+        raise ConnectionError("No ADB devices are online. Start the emulator or connect its ADB address in the panel (MuMu usually uses 127.0.0.1:16384; 5037 is the server port).")
 
     if len(devices) == 1:
         return devices[0]

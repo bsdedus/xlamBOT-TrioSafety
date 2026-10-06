@@ -13,13 +13,13 @@ import time
 import traceback
 from typing import Any, Callable
 
-from adb_connection import BoundedAdbClient, foreground_package, unique_devices
+from adb_connection import AUTO_CONNECTOR, BoundedAdbClient, foreground_package, tcp_address, unique_devices
 
 adb = BoundedAdbClient()
 
 import device_profiles
 from bot_instance import run_bot_instance
-from utils import clean_queue, config_scope
+from utils import clean_queue, config_scope, load_toml_as_dict
 from window_controller import WindowController, get_device_by_serial, is_brawl_stars_package
 
 ANSI_CLEAN_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
@@ -151,7 +151,8 @@ class DeviceRuntimeManager:
     def list_adb_devices() -> list[dict[str, Any]]:
         devices = []
         try:
-            raw_devices = unique_devices(adb.device_list())
+            preferred = load_toml_as_dict('cfg/general_config.toml').get('emulator_port')
+            raw_devices = unique_devices(AUTO_CONNECTOR.refresh(adb, adb.device_list(), preferred))
         except Exception as error:
             return [{"ok": False, "message": f"ADB unavailable: {error}"}]
 
@@ -196,10 +197,12 @@ class DeviceRuntimeManager:
         if not address:
             return {"ok": False, "message": "An address like 127.0.0.1:5555 is required."}
         try:
+            address = tcp_address(address)
             adb.connect(address)
             device = get_device_by_serial(address)
             if device.get_state() != "device":
                 return {"ok": False, "message": f"Could not connect to {address}: device is not online."}
+            AUTO_CONNECTOR.remember(address)
         except Exception as error:
             return {"ok": False, "message": f"Could not connect to {address}: {error}"}
         return {"ok": True, "message": f"Connected to {device.serial}.", "serial": device.serial}
@@ -208,7 +211,9 @@ class DeviceRuntimeManager:
     def disconnect_network_device(address: str) -> dict[str, Any]:
         address = str(address or "").strip()
         try:
+            address = tcp_address(address)
             adb.disconnect(address)
+            AUTO_CONNECTOR.remember(address, disconnected=True)
         except Exception as error:
             return {"ok": False, "message": f"Could not disconnect {address}: {error}"}
         return {"ok": True, "message": f"Disconnected {address}."}
