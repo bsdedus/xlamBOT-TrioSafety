@@ -101,7 +101,8 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6):
     class_ids = np.argmax(class_scores, axis=1)
     confidences = class_scores[np.arange(n_detections), class_ids]
 
-    mask = confidences >= conf_tresh
+    mask = (confidences >= conf_tresh) & np.isfinite(prediction).all(axis=1)
+    mask &= (boxes_cxcywh[:, 2] > 0) & (boxes_cxcywh[:, 3] > 0)
 
     if not np.any(mask):
         return []
@@ -149,6 +150,7 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6):
 
 class Detect:
     def __init__(self, model_path, ignore_classes=None, classes=None, input_size=(640, 640)):
+        self._inference_lock = threading.RLock()
         threads_to_use = load_toml_as_dict("cfg/general_config.toml")['used_threads']
 
         def get_optimal_threads(max_limit=6):
@@ -219,13 +221,15 @@ class Detect:
         return model, used_provider
 
     def preprocess_image(self, img):
+        if img is None or getattr(img, 'ndim', 0) != 3 or img.shape[2] != 3 or not img.size:
+            raise ValueError('Detector requires a non-empty RGB image')
         h, w = img.shape[:2]
         if h <= 0 or w <= 0:
             raise ValueError('Cannot infer an empty image')
 
         scale = min(self.input_size[0] / h, self.input_size[1] / w)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
+        new_w = max(1, min(self.input_size[1], int(w * scale)))
+        new_h = max(1, min(self.input_size[0], int(h * scale)))
 
         resized_img = cv2.resize(
             img,
@@ -264,7 +268,11 @@ class Detect:
                 det[:, 1] *= scale_h
                 det[:, 2] *= scale_w
                 det[:, 3] *= scale_h
-                results.append(det)
+                det[:, [0, 2]] = np.clip(det[:, [0, 2]], 0, orig_w)
+                det[:, [1, 3]] = np.clip(det[:, [1, 3]], 0, orig_h)
+                valid = (det[:, 2] > det[:, 0]) & (det[:, 3] > det[:, 1])
+                if np.any(valid):
+                    results.append(det[valid])
 
         return results
 

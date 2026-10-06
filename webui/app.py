@@ -6,16 +6,22 @@ import hmac
 import logging
 import secrets
 import threading
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 from flask import Flask, jsonify, render_template, request, send_file
+from pathlib import Path
 from werkzeug.exceptions import HTTPException
 
 from discord_bot import DiscordBot
-from utils import DATA_ROOT, PROJECT_ROOT, clean_queue, get_brawler_icon_path, resolve_project_path, resolve_within, \
+from utils import DATA_ROOT, PROJECT_ROOT, clean_queue, game_mode_warning, gas_mode_warning, get_brawler_icon_path, resolve_project_path, resolve_within, \
     save_dict_as_toml, resolve_config_path, load_toml_as_dict
 import device_profiles
 from .device_manager import DeviceRuntimeManager
+import brawler_calibration
+import training_capture
+import update_client
+from training_capture import TrainingRecorder
 from .runtime import RuntimeManager
 from .services import WebDataService
 from .resource_updates import ResourceUpdater
@@ -145,11 +151,23 @@ def create_app(xlambot_main, start_discord_bot=False):
     discord_bot = DiscordBot(runtime_manager, data_service)
     runtime_manager.configure_start_gate(data_service.get_queue_data, data_service.get_auth_state)
     device_manager = DeviceRuntimeManager(xlambot_main, discord_bot)
+    # Один на всё приложение: запись идёт в фоне, и панель не должна её терять
+    # между запросами, как это было бы с записью на каждый вызов.
+    training_recorder = TrainingRecorder(device_manager)
     device_manager.configure_queue_provider(device_profiles.load_queue)
     app.config["runtime_manager"] = runtime_manager
     app.config["data_service"] = data_service
     app.config["discord_bot"] = discord_bot
     app.config["device_manager"] = device_manager
+    app.config["training_recorder"] = training_recorder
+    def update_busy():
+        states = device_manager.all_statuses() + [runtime_manager.get_status()]
+        if any(s.get('is_running') or s.get('state') in {'starting', 'stopping', 'pausing', 'paused'} for s in states):
+            return True
+        with training_recorder._lock:
+            return any(t.is_alive() for t in training_recorder._threads.values())
+    updater = update_client.UpdateManager(update_busy, update_client.restart_application)
+    app.config['update_manager'] = updater
     app.config["discord_bot_thread"] = None
     app.config["discord_bot_lock"] = threading.Lock()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
@@ -190,6 +208,12 @@ def create_app(xlambot_main, start_discord_bot=False):
             return None
 
         supplied_token = str(request.headers.get("X-Xlam-UI-Token", ""))
+        if not supplied_token:
+            # <img src> не умеет слать свои заголовки, а кадры для разметки
+            # грузятся именно так. Токен поэтому принимается и в адресе - иначе
+            # страница открывается пустой, с запросами в 403 и без единой
+            # картинки. Сравнение всё то же, и для чужих страниц токена нет.
+            supplied_token = str(request.args.get("t", ""))
         if not hmac.compare_digest(supplied_token, app.config["UI_API_TOKEN"]):
             return jsonify({
                 "ok": False,
@@ -241,6 +265,98 @@ def create_app(xlambot_main, start_discord_bot=False):
             ui_api_token=app.config["UI_API_TOKEN"],
             asset_version=resource_updater.status()['revision'],
         )
+
+    calibration_frames = {}
+
+    @app.context_processor
+    def interface_assets():
+        newest = 0
+        for name in ('static', 'templates'):
+            for asset in Path(resolve_project_path(name)).rglob('*'):
+                if asset.is_file():
+                    newest = max(newest, asset.stat().st_mtime_ns)
+        return {'ui_version': newest}
+
+    @app.get('/training')
+    def training_library():
+        return render_template('sessions.html', ui_api_token=app.config['UI_API_TOKEN'])
+
+    @contextmanager
+    def calibration_device(key):
+        brawler_calibration.key_for(key)
+        status = device_manager.get_status(key)
+        if status.get('is_running') or status.get('state') in {'starting', 'running', 'paused', 'pausing', 'stopping'}:
+            raise ValueError('Остановите бот на этом устройстве перед калибровкой. Паузы недостаточно.')
+        from window_controller import get_device_by_serial
+        from device_lease import DeviceLease
+        serial = device_manager.resolve_serial(key)
+        lease = DeviceLease(serial)
+        try:
+            yield get_device_by_serial(serial)
+        finally:
+            lease.close()
+
+    def calibration_frame(key, payload):
+        import time
+        frame = calibration_frames.get(key)
+        if not frame or frame['id'] != payload.get('frame') or time.monotonic() - frame['time'] > 300:
+            raise ValueError('Обновите снимок экрана перед сохранением или проверкой.')
+        return frame
+
+    @app.get('/calibration/<key>')
+    def calibration_page(key):
+        brawler_calibration.key_for(key)
+        assets = [resolve_project_path('static', 'css', 'calibration.css'), resolve_project_path('static', 'js', 'calibration.js')]
+        newest = max((os.path.getmtime(p) for p in assets if p.is_file()), default=0)
+        return render_template('calibration.html', device_key=key, ui_api_token=app.config['UI_API_TOKEN'], asset_version=int(newest))
+
+    @app.get('/api/brawler-calibration/<key>')
+    def calibration_read(key):
+        return jsonify(brawler_calibration.read(key))
+
+    @app.get('/api/brawler-calibration/<key>/snapshot')
+    def calibration_snapshot(key):
+        import io
+        import time
+        with device_manager._start_lock, calibration_device(key) as device:
+            image = device.screenshot()
+            width, height = image.size
+            if width < height:
+                raise ValueError('Поверните игру в горизонтальное положение.')
+            stamp = secrets.token_hex(16)
+            calibration_frames[key] = dict(id=stamp, width=width, height=height, time=time.monotonic())
+            buffer = io.BytesIO()
+            image.convert('RGB').save(buffer, format='JPEG', quality=90)
+        response = app.response_class(buffer.getvalue(), mimetype='image/jpeg')
+        response.headers.update({'Cache-Control': 'no-store', 'X-Calibration-Frame': stamp, 'X-Calibration-Width': str(width), 'X-Calibration-Height': str(height)})
+        return response
+
+    @app.post('/api/brawler-calibration/<key>')
+    def calibration_save(key):
+        body = request.get_json(silent=True) or {}
+        with device_manager._start_lock, calibration_device(key) as device:
+            frame = calibration_frame(key, body)
+            if tuple(device.screenshot().size) != (frame['width'], frame['height']):
+                raise ValueError('Разрешение изменилось. Обновите снимок экрана.')
+            return jsonify(brawler_calibration.save(key, body.get('points', {}), body.get('regions', {}), (frame['width'], frame['height'])))
+
+    @app.post('/api/brawler-calibration/<key>/tap')
+    def calibration_tap(key):
+        body = request.get_json(silent=True) or {}
+        point = brawler_calibration.validate({body.get('point'): body.get('value')}, [p[0] for p in brawler_calibration.POINTS])
+        with device_manager._start_lock, calibration_device(key) as device:
+            frame = calibration_frame(key, body)
+            if tuple(device.screenshot().size) != (frame['width'], frame['height']):
+                raise ValueError('Разрешение изменилось. Обновите снимок экрана.')
+            x, y = next(iter(point.values()))
+            calibration_frames.pop(key, None)
+            device.shell(['input', 'tap', str(min(frame['width'] - 1, round(x * frame['width'] / 1920))), str(min(frame['height'] - 1, round(y * frame['height'] / 1080)))], timeout=5)
+        return jsonify({'ok': True})
+
+    @app.post('/api/brawler-calibration/<key>/reset')
+    def calibration_reset(key):
+        with device_manager._start_lock, calibration_device(key):
+            return jsonify(brawler_calibration.reset(key))
 
     # --- Multi-device panel API ----------------------------------------------
     def _device_key_arg():
@@ -331,6 +447,17 @@ def create_app(xlambot_main, start_discord_bot=False):
                 device["meta"] = device_profiles.read_profile_meta(device["key"])
             except Exception:
                 device["meta"] = {}
+            # Mismatches we can prove: a playstyle written for another mode, and
+            # gas avoidance switched on where the game has no gas. Both are read
+            # in the device's own profile, or one device's mode would speak for
+            # all.
+            try:
+                with device_profiles.use_profile(device["key"]):
+                    device["mode_warning"] = game_mode_warning()
+                    device["gas_warning"] = gas_mode_warning()
+            except Exception:
+                device["mode_warning"] = None
+                device["gas_warning"] = None
         return jsonify({"ok": True, "devices": devices, "profiles": device_profiles.list_profiles()})
 
     @app.get("/api/devices/status")
@@ -365,6 +492,142 @@ def create_app(xlambot_main, start_discord_bot=False):
             raise KeyError("A device serial is required.")
         return jsonify(DeviceRuntimeManager.reset_device_display(serial))
 
+    # ───────────────────────── обучение на кадрах ─────────────────────────
+    # Запись матча и разметка разнесены: бот играет сам, а рамки ставит человек
+    # потом, в своём темпе. Иначе разметка держала бы матч открытым.
+
+    @app.get("/api/devices/<path:key>/training")
+    def device_training_status(key: str):
+        key = device_profiles.sanitize_key(key)
+        current = training_recorder.status(key)
+        sessions = [s for s in training_recorder.all_sessions() if s["key"] == key]
+        return jsonify({"ok": True, "current": current, "sessions": sessions[:5]})
+
+    @app.post("/api/devices/<path:key>/training/start")
+    def device_training_start(key: str):
+        """Start recording, and start the bot if it is not already playing.
+
+        The point of the button is one press and a recorded match, so a stopped
+        bot is started here rather than making the operator click twice and
+        wonder why nothing is being written.
+        """
+        key = device_profiles.sanitize_key(key)
+        payload = request.get_json(silent=True) or {}
+        try:
+            interval = float(payload.get("interval") or 3.0)
+        except (TypeError, ValueError):
+            interval = 3.0
+        try:
+            frame_count = int(payload.get("frame_count") or 0)
+        except (TypeError, ValueError):
+            frame_count = 0
+
+        status = device_manager.get_status(key)
+        started_bot = False
+        if not status.get("is_running"):
+            serial = payload.get("serial") or device_manager.resolve_serial(key)
+            result = device_manager.start(key, serial)
+            if not result.get("ok"):
+                raise ValueError(result.get("message") or "Не удалось запустить бота.")
+            started_bot = True
+
+        result = training_recorder.start(key, interval=interval, frame_count=frame_count)
+        if not result.get("ok"):
+            return jsonify({**result, "started_bot": started_bot}), 409
+        return jsonify({**result, "started_bot": started_bot})
+
+    @app.post("/api/devices/<path:key>/training/stop")
+    def device_training_stop(key: str):
+        key = device_profiles.sanitize_key(key)
+        return jsonify(training_recorder.stop(key))
+
+    def _class_choices(names=None):
+        return training_capture.class_choices(names)
+
+    @app.get("/api/training/sessions")
+    def training_sessions_list():
+        return jsonify({"ok": True, "sessions": training_recorder.all_sessions(),
+                        "classes": _class_choices()})
+
+    @app.get("/api/training/sessions/<session_id>")
+    def training_session_detail(session_id: str):
+        session = training_recorder.session(session_id)
+        if session is None:
+            raise KeyError("Такой записи нет.")
+        return jsonify({"ok": True, "session": session.detail(),
+                        "classes": _class_choices(session.meta["classes"])})
+
+    @app.get("/api/training/sessions/<session_id>/images/<path:name>")
+    def training_session_image(session_id: str, name: str):
+        session = training_recorder.session(session_id)
+        if session is None:
+            raise KeyError("Такой записи нет.")
+        target = (session.folder / "images" / Path(name).name).resolve()
+        if not str(target).startswith(str(session.folder.resolve())) or not target.exists():
+            raise FileNotFoundError(name)
+        return send_file(target, mimetype="image/jpeg")
+
+    @app.post("/api/training/sessions/<session_id>/labels")
+    def training_session_labels(session_id: str):
+        """Boxes for one frame, in the pixels the operator drew."""
+        session = training_recorder.session(session_id)
+        if session is None:
+            raise KeyError("Такой записи нет.")
+        payload = request.get_json(silent=True) or {}
+        frame = str(payload.get("frame") or "")
+        boxes = payload.get("boxes")
+        if not frame:
+            raise KeyError("Нужен 'frame'.")
+        if boxes is None:
+            # Пустой список - законный ответ: кадр посмотрели и там ничего нет.
+            # Раньше отсутствие поля считалось ошибкой, и клиент, который просто
+            # не прислал рамки, получал 400 вместо отметки "пусто".
+            boxes = []
+        if not isinstance(boxes, list):
+            raise KeyError("'boxes' должен быть списком.")
+        saved = session.set_boxes(frame, boxes, bool(payload.get("checked")), payload.get("revision"), bool(payload.get("excluded")))
+        if saved is None:
+            raise KeyError("Кадра нет в этой записи.")
+        return jsonify({"ok": True, "session": session.summary(), "frame": saved})
+
+    @app.get("/api/training/sessions/<session_id>/export.zip")
+    def training_session_export(session_id: str):
+        session = training_recorder.session(session_id)
+        if session is None:
+            raise KeyError("Такой записи нет.")
+        summary = session.summary()
+        if summary["frames"] and summary["checked"] < summary["frames"]:
+            raise ValueError(
+                f"Размечено {summary['checked']} из {summary['frames']}. "
+                "Отметьте остальные как пустые, если на них ничего нет.")
+        archive = session.export_zip()
+        return send_file(archive, mimetype="application/zip", as_attachment=True,
+                         download_name=f"xlamBOT-dataset-{session_id}.zip")
+
+    @app.get("/training/<session_id>")
+    def training_page(session_id: str):
+        if training_recorder.session(session_id) is None:
+            raise KeyError("Такой записи нет.")
+        # Токен и версия статики обязательны: без токена все запросы разметки
+        # получают 403 и страница выглядит пустой, без версии бракер отдаёт
+        # прошлую версию скрипта - ровно это и случилось при первом запуске.
+        assets = [
+            resolve_project_path("static", "css", "training.css"),
+            resolve_project_path("static", "js", "training.js"),
+        ]
+        newest = 0.0
+        for asset in assets:
+            try:
+                newest = max(newest, os.path.getmtime(asset))
+            except OSError:
+                continue
+        return render_template(
+            "training.html",
+            session_id=session_id,
+            ui_api_token=app.config["UI_API_TOKEN"],
+            asset_version=int(newest) if newest else 0,
+        )
+
     @app.post("/api/devices/selftest")
     def device_selftest():
         payload = request.get_json(silent=True) or {}
@@ -385,6 +648,55 @@ def create_app(xlambot_main, start_discord_bot=False):
             raise KeyError("A list of queue items is required.")
         device_profiles.save_queue(key, items)
         return jsonify({"ok": True, "items": device_profiles.load_queue(key)})
+
+    @app.get("/api/devices/<path:key>/brawler")
+    def device_brawler(key: str):
+        """The one brawler this device plays, or "" when it rotates."""
+        key = device_profiles.sanitize_key(key)
+        with device_profiles.use_profile(key):
+            locked = str(load_toml_as_dict("cfg/bot_config.toml").get("locked_brawler") or "").strip()
+        return jsonify({"ok": True, "locked_brawler": locked})
+
+    @app.post("/api/devices/<path:key>/brawler")
+    def device_set_brawler(key: str):
+        """Play exactly one brawler, or go back to rotating.
+
+        The name is checked against the same table play.py reads, because a
+        spelling the game does not know would leave the bot stuck on whichever
+        card it happened to be on - which is the failure this whole mode exists
+        to remove.
+        """
+        key = device_profiles.sanitize_key(key)
+        body = request.get_json(silent=True) or {}
+        name = str(body.get("brawler") or "").strip().lower()
+
+        catalog = {str(entry.get("name") or "").strip().lower()
+                   for entry in (data_service.get_brawler_catalog() or [])}
+        if name and name not in catalog:
+            raise KeyError(f"'{name}' is not a known brawler.")
+
+        trophies = 0
+        for entry in device_profiles.load_queue(key):
+            if str(entry.get("brawler", "")).strip().lower() == name:
+                trophies = entry.get("trophies") or 0
+                break
+
+        with device_profiles.use_profile(key):
+            device_profiles.update_settings(
+                key, "cfg/bot_config.toml", {"locked_brawler": name})
+        if name:            device_profiles.save_queue(key, [{
+                "brawler": name,
+                "type": "trophies",
+                # No goal: in this mode there is nothing to finish and move on
+                # from, so a target the bot could reach would only stop it.
+                "push_until": 100000,
+                "trophies": trophies,
+                "wins": 0,
+                "win_streak": 0,
+                "automatically_pick": True,
+            }])
+        return jsonify({"ok": True, "locked_brawler": name,
+                        "items": device_profiles.load_queue(key)})
 
     @app.get("/api/devices/<path:key>/settings")
     def device_settings(key: str):
@@ -447,6 +759,11 @@ def create_app(xlambot_main, start_discord_bot=False):
             return ("", 404)
         response = app.response_class(image, mimetype="image/jpeg")
         response.headers["Cache-Control"] = "no-store"
+        # Tell the panel how often this picture is really being refreshed, so the
+        # setting in the settings page is what governs it and not a number
+        # hardcoded in the browser.
+        response.headers["X-Preview-Interval-Ms"] = str(
+            int(device_manager.preview_interval(key) * 1000))
         return response
 
     @app.get("/api/bootstrap")
@@ -636,5 +953,33 @@ def create_app(xlambot_main, start_discord_bot=False):
 
     if start_discord_bot:
         _start_discord_bot_thread(app)
+
+    @app.get('/api/updates/status')
+    def update_status():
+        return jsonify(ok=True, **updater.snapshot())
+
+    @app.post('/api/updates/check')
+    def update_check():
+        updater.request_check()
+        return jsonify(ok=True)
+
+    @app.post('/api/updates/settings')
+    def update_settings_preferences():
+        return jsonify(ok=True, **updater.enabled((request.get_json(silent=True) or {}).get('enabled')))
+
+    @app.before_request
+    def update_start_gate():
+        if request.method == 'POST' and request.path.endswith('/start'):
+            updater.lock.acquire()
+            from flask import g
+            g.update_gate_locked = True
+            if updater.installing:
+                return jsonify(ok=False, message='Бот обновляется. Подождите перезапуска.'), 503
+
+    @app.teardown_request
+    def release_update_gate(error):
+        from flask import g
+        if getattr(g, 'update_gate_locked', False):
+            updater.lock.release()
 
     return app

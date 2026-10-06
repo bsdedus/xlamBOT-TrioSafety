@@ -160,15 +160,8 @@ class LobbyAutomation:
         # the first time a rotation actually reached this line.
         sort_label = self.SORT_LABELS.get(self.sort_menu_name(sort_point),
                                      "Least Trophies")
-        # card_index walks the visible grid. Zero is the first card, which is
-        # what the game's sort puts on top; anything higher is the next card in
-        # that same order, used when the first one is the brawler already played.
-        try:
-            index = max(0, int(card_index or 0))
-        except (TypeError, ValueError):
-            index = 0
-        first_card = buttons.get(f"brawlers_card_{index:02d}") or buttons.get(
-            "brawlers_first_card")
+        index = 0
+        first_card = buttons.get("brawlers_card_00") or buttons.get("brawlers_first_card")
         select_button = buttons.get("select_brawler")
         if not all([open_menu, sort_button, least, first_card, select_button]):
             print("Brawler sorting coordinates are missing from buttons_config.toml.")
@@ -304,6 +297,7 @@ class LobbyAutomation:
             runtime_control=runtime_control)
 
     def select_brawler(self, brawler, get_latest_state, stop_event=None, runtime_control=None):
+        self.last_picked = None
         self.window_controller.screenshot()
         wr = self.window_controller.width_ratio
         hr = self.window_controller.height_ratio
@@ -354,7 +348,12 @@ class LobbyAutomation:
             if self._sleep_interruptible(1.5, runtime_control, stop_event):
                 print("Brawler selection aborted by user.")
                 return "aborted"
-            self.window_controller.screenshot()
+            frame = self.window_controller.screenshot()
+            from state_finder import get_state
+            if get_state(frame) != 'lobby':
+                print('Brawler selection was not confirmed by the lobby screen.')
+                return 'failed'
+            self.last_picked = {'brawler': normalized_brawler, 'trophies': None}
             print("Selected brawler ", brawler_search_name)
             return "success"
 

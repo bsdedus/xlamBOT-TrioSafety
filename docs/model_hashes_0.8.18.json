@@ -1,0 +1,7 @@
+{
+  "closeTileDetector.onnx": "4ff4fec500b352e6fbc131030960e2d949c7a7f7a1e2e725c6e1d0a6d7443872",
+  "gasDetector.onnx": "459872929b94fc4903f209b7750f9824eda30397484159e6c541ea0b0404e1e2",
+  "jointDetector.onnx": "5876ebe81eb55aa17b3dd616420e4c2d8d2882ca0a48aeeae4bc68beae6185c2",
+  "mainInGameModel.onnx": "c12791a912484ca8cb30ffb60d27859730fe509ee30ea28dc2f975bf65c8ccb4",
+  "tileDetector.onnx": "8cfc1bb6a241dc8d8fd4536eba4efb929c3aa60bbc512ff1f51766dae138107f"
+}

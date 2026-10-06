@@ -169,12 +169,12 @@ def read_result_death_count(frame):
     return values[0] if values[0]==values[1] else None
 
 
-def _digits(text: str):
+def _digits(text: str, allow_zero=False):
     match = re.search(r"\d{1,7}", str(text).replace(" ", ""))
     if not match:
         return None
     value = int(match.group())
-    return value if value > 0 else None
+    return value if value > 0 or (allow_zero and value == 0) else None
 
 
 def read(frame, region=DEFAULT_REGION) -> int | None:
@@ -218,10 +218,12 @@ def read_account_total(frame, expected=None):
     """
     if not OCR_AVAILABLE or frame is None or frame.size == 0:
         return None
+    from brawler_calibration import region_for
+    custom = region_for('account_total')
     candidates = []
-    for region in ACCOUNT_TOTAL_REGIONS:
-        value = _read_region_digits(frame, region)
-        if value is not None and 1000 <= value <= 999999:
+    for region in [custom] if custom is not None else ACCOUNT_TOTAL_REGIONS:
+        value = _read_region_digits(frame, region, allow_zero=True) if custom is not None else _read_region_digits(frame, region)
+        if value is not None and (0 if custom is not None else 1000) <= value <= 999999:
             candidates.append(value)
     if not candidates:
         return None
@@ -252,6 +254,8 @@ def read_account_total(frame, expected=None):
         if same_shape:
             return min(same_shape, key=lambda v: abs(v - expected))
         return None
+    if custom is not None:
+        return candidates[0]
     # With no history to lean on, only a value seen in more than one crop is
     # worth reporting; a single crop is how 317550 got believed.
     for value in candidates:
@@ -292,25 +296,8 @@ def _completions(values, expected):
     return list(dict.fromkeys(out))
 
 
-# The grid the rotation walks, matching brawlers_card_NN in buttons_config.
-# Three visible columns by three rows; the fourth column is off the screen.
-CARD_GRID_COLUMNS = 3
-CARD_GRID_ROWS = 3
-CARD_COLUMN_STEP = 475
-CARD_ROW_STEP = 293
-
-
 def card_offset(card_index):
-    """How far a card sits from the first one, in grid steps."""
-    try:
-        index = max(0, int(card_index or 0))
-    except (TypeError, ValueError):
-        index = 0
-    if index >= CARD_GRID_COLUMNS * CARD_GRID_ROWS:
-        index = 0
-    column = index % CARD_GRID_COLUMNS
-    row = index // CARD_GRID_COLUMNS
-    return column * CARD_COLUMN_STEP, row * CARD_ROW_STEP
+    return (0, 0)
 
 
 def shifted(region, card_index):
@@ -337,8 +324,16 @@ def read_card(frame, card_index=0):
         return result
     result["brawler"] = _read_card_name(frame, card_index)
     result["trophies"] = _read_region_digits(
-        frame, shifted(FIRST_CARD_TROPHY_REGION, card_index))
+        frame, _calibrated_card_region(FIRST_CARD_TROPHY_REGION, card_index, 'card_trophies'))
     return result
+
+
+def _calibrated_card_region(region, card_index, kind):
+    from brawler_calibration import card_region
+    try:
+        return card_region(region, card_index, kind)
+    except (KeyError, ValueError, TypeError, OSError):
+        return shifted(region, card_index)
 
 
 def read_first_card(frame, card_index=0):
@@ -409,10 +404,13 @@ def _read_card_name(frame, card_index=0):
     known = _known_brawler_names()
     if not known:
         return None
-    dx, dy = card_offset(card_index)
+    tried = set()
     seen = []
     for index, region in enumerate(CARD_NAME_REGIONS):
-        moved = (region[0] + dx, region[1] + dy, region[2], region[3])
+        moved = _calibrated_card_region(region, card_index, 'card_name')
+        if moved in tried:
+            continue
+        tried.add(moved)
         for config in (NAME_OCR_CONFIG, NAME_OCR_LOOSE_CONFIG):
             text = _read_region_text(frame, moved, config)
             if not text:
@@ -463,5 +461,5 @@ def _read_region_text(frame, region, config, scale=4):
         return ""
 
 
-def _read_region_digits(frame, region):
-    return _digits(_read_region_text(frame, region, OCR_CONFIG))
+def _read_region_digits(frame, region, allow_zero=False):
+    return _digits(_read_region_text(frame, region, OCR_CONFIG), allow_zero=allow_zero)

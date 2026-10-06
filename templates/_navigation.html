@@ -1,0 +1,11 @@
+<aside class="app-rail" aria-label="Главная навигация">
+  <a class="app-brand" href="/panel" aria-label="xlamBOT — устройства"><span class="app-monogram app-avatar" aria-hidden="true"></span><span class="app-wordmark">xlam<span>BOT</span><small>Твоя игровая станция</small></span></a>
+  <div class="rail-label">Рабочее пространство</div>
+  <nav class="app-nav">
+    <a href="/panel" class="{{ 'is-current' if active_page == 'devices' else '' }}" {{ 'aria-current=page' if active_page == 'devices' else '' }} title="Устройства"><svg class="ui-icon" aria-hidden="true"><use href="#icon-device-desktop"/></svg><span>Устройства</span></a>
+    <a href="/" class="{{ 'is-current' if active_page == 'settings' else '' }}" {{ 'aria-current=page' if active_page == 'settings' else '' }} title="Настройки"><svg class="ui-icon" aria-hidden="true"><use href="#icon-adjustments-horizontal"/></svg><span>Настройки</span></a>
+    <a href="/training" class="{{ 'is-current' if active_page == 'training' else '' }}" {{ 'aria-current=page' if active_page == 'training' else '' }} title="Обучение"><svg class="ui-icon" aria-hidden="true"><use href="#icon-stack-2"/></svg><span>Обучение</span></a>
+    {% if device_key %}<a href="/calibration/{{ device_key | urlencode }}" class="is-current" aria-current="page" title="Калибровка"><svg class="ui-icon" aria-hidden="true"><use href="#icon-focus-2"/></svg><span>Калибровка</span></a>{% endif %}
+  </nav>
+  <div class="rail-bottom"><div class="rail-tip"><span class="rail-tip-icon">✦</span><p>Всё под контролем<small>Один профиль для каждого устройства.</small></p></div><a href="https://t.me/xlamModz" target="_blank" rel="noreferrer" class="rail-channel" title="Канал xlamModz"><span>↗</span><span>Сообщество xlamModz</span></a><span class="rail-footer">Неофициальный проект</span></div>
+</aside>

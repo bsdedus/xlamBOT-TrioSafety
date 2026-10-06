@@ -6,15 +6,13 @@
     <meta name="xlam-ui-token" content="{{ ui_api_token }}">
     <meta name="xlam-resource-version" content="{{ asset_version }}">
     <title>xlamBOT — настройки</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="icon" type="image/png" href="/api/assets/support/xlambot_logo.png">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/panel.css') }}?v={{ asset_version }}">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/studio.css') }}?v={{ asset_version }}">
-</head>
-<body class="studio-body">
-    <header class="studio-header">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/panel.css') }}?v={{ ui_version }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/studio.css') }}?v={{ ui_version }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/interface.css') }}?v={{ ui_version }}"><link rel="stylesheet" href="{{ url_for('static', filename='css/sprites.css') }}?v={{ ui_version }}"></head>
+<body class="studio-body app-page">
+    {% set active_page='settings' %}{% include '_sprites.html' %}{% include '_navigation.html' %}
+    <header class="studio-header"><div class="page-heading"><div><div class="page-kicker">ПЕРСОНАЛЬНАЯ НАСТРОЙКА</div><h1>Настрой под себя<span class="heading-dot">.</span></h1><p>Бойцы, поведение бота и история твоих матчей.</p></div><span class="studio-decoration sprite-spike" aria-hidden="true"></span></div>
         <a class="studio-brand" href="/panel">
             <img class="studio-logo" src="/api/assets/support/xlambot_logo.png" alt="xlamBOT">
             <div>
@@ -24,7 +22,7 @@
         </a>
         <nav class="studio-tabs" id="tabs">
             <button class="studio-tab is-active" data-tab="dashboard" type="button">Обзор</button>
-            <button class="studio-tab" data-tab="queue" type="button">Очередь</button>
+            <button class="studio-tab" data-tab="brawlers" type="button">Боец</button>
             <button class="studio-tab" data-tab="playstyles" type="button">Плейстайлы</button>
             <button class="studio-tab" data-tab="settings" type="button">Настройки</button>
             <button class="studio-tab" data-tab="history" type="button">История</button>
@@ -49,7 +47,7 @@
             </div>
         </details>
         <section class="studio-view is-active" id="view-dashboard"></section>
-        <section class="studio-view" id="view-queue"></section>
+        <section class="studio-view" id="view-brawlers"></section>
         <section class="studio-view" id="view-playstyles"></section>
         <section class="studio-view" id="view-settings"></section>
         <section class="studio-view" id="view-history"></section>
@@ -57,7 +55,7 @@
     </main>
 
     <div id="toast" class="toast hidden"></div>
-    <script src="{{ url_for('static', filename='js/studio.js') }}?v={{ asset_version }}"></script>
+    <script src="{{ url_for('static', filename='js/ui-session.js') }}?v={{ ui_version }}"></script><script src="{{ url_for('static', filename='js/studio.js') }}?v={{ ui_version }}"></script>
     <script src="{{ url_for('static', filename='js/resource_updates.js') }}?v={{ asset_version }}"></script>
 </body>
 </html>

@@ -21,13 +21,13 @@ from stage_manager import StageManager
 from state_finder import get_state
 from time_management import TimeManagement
 from utils import (
-    cprint, clean_queue, load_playstyle_script, load_toml_as_dict, notify_user, save_brawler_data, resolve_project_path,
+    cprint, clean_queue, game_mode_warning, gas_mode_warning, load_playstyle_script, load_toml_as_dict, notify_user, save_brawler_data, resolve_project_path,
 )
 
 # Imported as plain modules, not as device-scoped helpers: every instance already
 # runs inside its own config_scope, so the state this file touches belongs to the
 # thread's device rather than to whichever device loaded the module first.
-from window_controller import WindowController
+from window_controller import StaleFrameError, WindowController
 
 
 class BotHalt(RuntimeError):
@@ -94,6 +94,12 @@ class BotInstance:
         print(f"[{self.device_label}] Starting with queue data: {data}")
 
         self.playstyle_info, playstyle_code = load_playstyle_script(current_playstyle)
+        self.mode_warning = game_mode_warning(self.playstyle_info)
+        if self.mode_warning:
+            print(f"[{self.device_label}] {self.mode_warning}")
+        gas_warning = gas_mode_warning()
+        if gas_warning:
+            print(f"[{self.device_label}] {gas_warning}")
         self.Play = Play(*self.load_models(), self.window_controller, playstyle_code)
         self.Time_management = TimeManagement()
         self.lobby_automator = LobbyAutomation(self.window_controller)
@@ -245,6 +251,8 @@ class BotInstance:
             return self.state
 
     def handle_detected_state(self, state):
+        if state != "match":
+            self.window_controller.gameplay_frame_time = None
         if state is None:
             return
         if state == "connection_lost":
@@ -579,6 +587,10 @@ class BotInstance:
             self.Play.current_brawler = brawler
             try:
                 self.Play.main(frame, brawler, self)
+            except StaleFrameError:
+                self.window_controller.release_all_inputs()
+                time.sleep(0.05)
+                continue
             except ConnectionError as error:
                 self.window_controller.release_all_inputs()
                 print(f'[{self.device_label}] Input/frame recovery: {error}')

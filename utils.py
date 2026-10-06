@@ -42,7 +42,7 @@ def _get_project_root():
         if base:
             return Path(base)
         return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return Path(os.environ.get('XLAMBOT_BUNDLE_ROOT') or Path(__file__).resolve().parent)
 
 
 PROJECT_ROOT = _get_project_root()
@@ -84,6 +84,13 @@ initialize_user_data()
 
 
 def resolve_project_path(*parts) -> Path:
+    import update_client
+    if parts and str(parts[0]).replace('\\', '/').split('/')[0] in {'static', 'templates'}:
+        overlay = update_client.ACTIVE_OVERLAY
+        if overlay:
+            candidate = overlay.joinpath(*parts)
+            if candidate.exists():
+                return candidate
     return PROJECT_ROOT.joinpath(*parts)
 
 
@@ -200,8 +207,7 @@ def load_toml_as_dict(file_path, cache=True):
     if str(full_path) in cached_toml and cache:
         return deepcopy(cached_toml[str(full_path)])
     try:
-        with open(full_path, 'r', encoding='utf-8') as f:
-            data = toml.load(f)
+        data = toml.loads(read_text_auto(full_path))
     except Exception as e:
         print(f"Error loading {full_path}: {e}")
         return {}
@@ -211,8 +217,7 @@ def load_toml_as_dict(file_path, cache=True):
     repo_path = PROJECT_ROOT.joinpath(str(file_path).lstrip('/\\'))
     if str(repo_path) != str(full_path) and repo_path.exists():
         try:
-            with open(repo_path, 'r', encoding='utf-8') as f:
-                data = _merge_over(toml.load(f), data)
+            data = _merge_over(toml.loads(read_text_auto(repo_path)), data)
         except Exception as e:  # noqa: BLE001
             print(f"Error merging {repo_path} under {full_path}: {e}")
     cached_toml[str(full_path)] = deepcopy(data)
@@ -305,10 +310,26 @@ def account_state_path() -> Path:
     return resolve_runtime_path("account_state.json")
 
 
+def read_text_auto(path, errors="replace"):
+    """Прочитать текст, не падая на чужой кодировке.
+
+    Панель и бот читают конфиги, плейстайлы и очередь как utf-8. Файл, сохранённый
+    в блокноте на русской Windows, приходит в cp1251, и чтение падало с
+    'utf-8' codec can't decode byte ... - панель при этом показывала одни
+    прочерки, а бот падал в last_error. Пробуем utf-8, затем cp1251, и если не
+    подошёл ни один - читаем с заменой символов, потому что частично верный
+    текст полезнее пустоты.
+    """
+    raw = Path(path).read_bytes()
+    for encoding in ("utf-8", "cp1251"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors=errors)
+
+
 def save_brawler_data(data):
-    """
-    Save the given data to a json file. As a list of dictionaries.
-    """
     queue_path = brawler_queue_path(for_write=True)
     queue_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(queue_path,json.dumps(data,indent=4))
@@ -319,8 +340,7 @@ def load_brawler_data():
     if not queue_path.exists():
         return []
     try:
-        with open(queue_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        data = json.loads(read_text_auto(queue_path))
         return clean_queue(data) if isinstance(data, list) else []
     except Exception as e:
         traceback.print_exc()
@@ -859,62 +879,75 @@ SAFE_GLOBALS = {
 import ast
 
 def is_safe_ast(code_str):
+    import ast
     try:
         tree = ast.parse(code_str)
-    except SyntaxError as e:
-        return False, f"Syntax Error: {e}"
-
+    except (SyntaxError, RecursionError) as error:
+        return False, 'Syntax error: ' + str(error)
+    forbidden = {'locals', 'getattr', 'exec', 'breakpoint', 'delattr', 'eval', 'open', '__import__', 'setattr', 'globals', 'vars', 'compile'}
     for node in ast.walk(tree):
-        # 1. Block access to any attributes starting with underscore (e.g. __class__)
-        if isinstance(node, ast.Attribute):
-            if node.attr.startswith('_'):
-                return False, f"Access to private/dunder attribute '{node.attr}' is forbidden."
-        
-        # 2. Block imports of any kind inside the script
         if isinstance(node, (ast.Import, ast.ImportFrom)):
-            return False, "Imports are not allowed in playstyle scripts."
-            
-        # 3. Block calling of eval, exec, compile, etc.
-        if isinstance(node, ast.Name):
-            if node.id in {'exec', 'eval', 'compile', 'getattr', 'setattr', 'delattr', '__import__', 'open', 'globals', 'locals', 'vars', 'breakpoint'}:
-                return False, f"Call to '{node.id}' is forbidden."
-
-
+            return False, 'Imports are not allowed in playstyle scripts.'
+        if isinstance(node, ast.Attribute) and node.attr.startswith('_'):
+            return False, 'Private attributes are forbidden.'
+        if isinstance(node, ast.Name) and node.id in forbidden:
+            return False, 'Forbidden name: ' + node.id
+        if isinstance(node, (ast.While, ast.AsyncFunctionDef, ast.Await, ast.Try)):
+            return False, 'Unbounded loops, async and exception handlers are not allowed in a frame strategy.'
+        if isinstance(node, ast.Attribute) and node.attr == 'sleep':
+            return False, 'Sleeping is not allowed in a frame strategy; store a timestamp instead.'
     return True, None
 
 
 def interpret_playstyle_code(playstyle_code, context):
+    import sys
+    import time
+    import types
     safe_globals = SAFE_GLOBALS.copy()
     safe_globals.update(context)
     safe_globals['__builtins__'] = {}
-
-    try:
-        if isinstance(playstyle_code, str):
-            is_safe, error_msg = is_safe_ast(playstyle_code)
-            if not is_safe:
-                print(f"Security/Syntax Validation Failed for playstyle: {error_msg}")
-                return None, safe_globals
-            compiled_code = compile(playstyle_code, '<string>', 'exec')
-        else:
-            compiled_code = playstyle_code
-
-        if compiled_code is not None:
-            exec(compiled_code, safe_globals)
-    except Exception as e:
-        print(f"Error executing .xlambot code")
-        traceback.print_exc()
+    # Expose clocks without a blocking sleep, including for precompiled scripts.
+    safe_globals['time'] = types.SimpleNamespace(time=time.time, monotonic=time.monotonic, perf_counter=time.perf_counter)
+    if playstyle_code is None:
         return None, safe_globals
-
-    return safe_globals.get('movement', None), safe_globals
+    if isinstance(playstyle_code, str):
+        safe, error = is_safe_ast(playstyle_code)
+        if not safe:
+            print('Playstyle rejected: ' + str(error))
+            return None, safe_globals
+        compiled = compile(playstyle_code, '<string>', 'exec')
+    else:
+        compiled = playstyle_code
+    deadline = time.perf_counter() + 0.25
+    script_file = compiled.co_filename
+    old_trace = sys.gettrace()
+    def budget(frame, event, arg):
+        if frame.f_code.co_filename == script_file:
+            if time.perf_counter() > deadline:
+                raise RuntimeError('Playstyle exceeded the 250 ms Python execution budget')
+            return budget
+        return None
+    try:
+        sys.settrace(budget)
+        exec(compiled, safe_globals)
+    except Exception as error:
+        # Discard partial movement instead of using a stale decision.
+        safe_globals['movement'] = (0, 0)
+        print('Playstyle stopped: ' + str(error))
+        return (0, 0), safe_globals
+    finally:
+        sys.settrace(old_trace)
+    return safe_globals.get('movement'), safe_globals
 
 
 def load_playstyle_script(filename):
     try:
         script_path = resolve_playstyle_path(filename)
-        with open(script_path, 'r', encoding='utf-8') as file:
-            metadata_header = file.readline().strip()
-            metadata = json.loads(metadata_header) if metadata_header else {}
-            playstyle_source = file.read()
+        text = read_text_auto(script_path)
+        lines = text.splitlines(True)
+        metadata_header = lines[0].strip() if lines else ""
+        metadata = json.loads(metadata_header) if metadata_header else {}
+        playstyle_source = text
         return metadata, playstyle_source
     except FileNotFoundError:
         print(f"Error: The playstyle file '{filename}' was not found.")
@@ -943,6 +976,96 @@ def load_default_playstyle():
     config = load_toml_as_dict("cfg/bot_config.toml")
     current_playstyle = config.get("current_playstyle", "default_up.xlambot")
     return load_playstyle_script(current_playstyle)
+
+
+def _mode_key(name):
+    """Fold a mode name to one comparable form.
+
+    Playstyles write "trio showdown", the config writes trio_showdown, and
+    comparing them as written flagged every correct pairing as a mismatch.
+    """
+    return "".join(ch if ch.isalnum() else "_" for ch in str(name).lower()).strip("_")
+
+
+# The only modes the game puts poison gas in. Everything else has no gas to
+# avoid, and the gas model cannot tell a bush from gas anyway.
+SHOWDOWN_MODES = frozenset({"solo_showdown", "duo_showdown", "trio_showdown"})
+
+
+def game_mode_warning(playstyle_info=None, config=None):
+    """Say when the playstyle was not written for the mode being played.
+
+    A playstyle carries the modes it fits in its first line, and nothing used to
+    read that field. So a Showdown survival script could drive a Heist match
+    with no complaint: the bot hides from fights the way you hide in Showdown,
+    which on a Heist map just looks like it is standing in the bushes. Silent
+    and plausible is exactly how this survived so long.
+
+    Returns the warning, or None when the playstyle fits, which is also the
+    answer when either side is unknown - an unlabelled playstyle or an unset
+    mode is not something to nag about.
+
+    A playstyle may also name something that is not a mode at all: the stock
+    scripts say "3v3, 5v5", which means any team game rather than one mode.
+    Those are treated as "no opinion", because warning that a generic script is
+    not written for Heist is noise, and it would fire on every default install.
+    """
+    if config is None:
+        config = load_toml_as_dict("cfg/bot_config.toml")
+    mode = str(config.get("game_mode") or "").strip()
+    if not mode:
+        return None
+    if playstyle_info is None:
+        playstyle_info, _ = load_default_playstyle()
+    declared = [_mode_key(name) for name in (playstyle_info or {}).get("gamemodes") or []]
+    declared = [name for name in declared if name]
+    if not declared or any(name in ("*", "all", "any", "any_mode") for name in declared):
+        return None
+    names = load_toml_as_dict("cfg/modes_config.toml").get("mode") or {}
+    known = {_mode_key(name) for name in names}
+    named = [name for name in declared if name in known]
+    if not named:
+        return None
+    if _mode_key(mode) in named:
+        return None
+    label = names.get(mode, mode)
+    wanted = ", ".join(
+        names.get(next((key for key in names if _mode_key(key) == name), name), name)
+        for name in named)
+    return (f'Плейстайл «{(playstyle_info or {}).get("name") or current_playstyle_name()}» '
+            f'написан для «{wanted}», а игра идёт в режиме «{label}». '
+            f'Бот будет вести себя не так, как задумано в плейстайле.')
+
+
+def gas_mode_warning(config=None):
+    """Warn when gas avoidance is on somewhere the game has no gas.
+
+    Poison gas is a Showdown thing. In Heist, Bounty, Knockout and the rest the
+    green on screen is bushes and map art, and the shipped gas model was trained
+    on exactly that - nine unique Heist frames of Nexus bushes - so it reads
+    those bushes as gas. Turning avoidance on there avoids nothing, it only
+    makes the bot run from a hedge, which is what "it walks into the gas" looks
+    like from the outside.
+
+    Returns the warning, or None when the setting cannot be wrong.
+    """
+    if config is None:
+        config = load_toml_as_dict("cfg/bot_config.toml")
+    if not config_bool(config.get("gas_avoidance"), False):
+        return None
+    mode = _mode_key(config.get("game_mode") or "")
+    if not mode or mode in SHOWDOWN_MODES:
+        return None
+    names = load_toml_as_dict("cfg/modes_config.toml").get("mode") or {}
+    label = names.get(str(config.get("game_mode")), config.get("game_mode"))
+    return (f'Обход газа включён, а в режиме «{label}» газа в игре нет — зелёное '
+            f'на экране это кусты. Модель газа обучена на кустах и принимает их за '
+            f'газ, поэтому бот будет убегать от кустов. Выключите gas_avoidance '
+            f'или играйте в шоудауне.')
+
+
+def current_playstyle_name():
+    return load_toml_as_dict("cfg/bot_config.toml").get("current_playstyle", "")
 
 
 def hash_playstyle(playstyle_info):
@@ -987,4 +1110,10 @@ def mask_secret(value: str | None) -> dict:
         "length": len(value),
         "masked": "*" * len(value),
     }
+
+
+
+import tempfile
+import threading
+_file_write_lock = threading.RLock()
 

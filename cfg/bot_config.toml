@@ -38,3 +38,13 @@ gas_danger_exit = 0.05
 gas_centre_bias = 0.06
 target_trophies = 1000
 brawler_pick_mode = "lowest_trophies"
+
+# Пустое имя сохраняет автоматический выбор первой карточки.
+locked_brawler = ""
+preview_interval_ms = 800
+training_frame_count = 10
+
+# Additional defaults from 0.8.18
+game_mode = "trio_showdown"
+training_classes = "gas,bush,wall,close_bush"
+gas_escape_cooldown = 0.35

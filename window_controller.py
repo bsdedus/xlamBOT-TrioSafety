@@ -211,8 +211,15 @@ def discover_device(verbose: bool = False) -> AdbDevice:
           f"{[d.serial for d in sorted_devices[1:]]}")
     return chosen
 
+class StaleFrameError(ConnectionError):
+    """Drop this decision and wait for a fresh frame."""
+
 class WindowController:
     def __init__(self, max_fps="auto", serial=None):
+        self.input_lock = threading.RLock()
+        self.input_enabled = True
+        self.active_touches = {}
+        self.gameplay_frame_time = None
         self.scale_factor = None
         self.width = None
         self.height = None
@@ -350,13 +357,22 @@ class WindowController:
         except Exception:  # noqa: BLE001
             return None, frame_time
 
-    def frame_to_jpeg(self, frame, quality: int = 70) -> bytes:
-        """Encode a frame as JPEG bytes; empty when there is nothing to encode."""
+    @staticmethod
+    def frame_to_jpeg(frame, quality: int = 70, max_width: int = 0) -> bytes:
+        """Encode a frame as JPEG bytes; empty when there is nothing to encode.
+
+        max_width scales it down first when it is set. The panel's device preview
+        is shown at a fraction of a phone screen, so encoding 1280x720 to then
+        shrink it in the browser costs real CPU for pixels nobody sees.
+        """
         if frame is None:
             return b""
         try:
             import cv2
 
+            if max_width and frame.shape[1] > max_width:
+                height, width = frame.shape[:2]
+                frame = cv2.resize(frame, (int(max_width), max(1, int(height * max_width / width))), interpolation=cv2.INTER_AREA)
             ok, buffer = cv2.imencode(".jpg", cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
             if not ok:
                 return b""
@@ -483,6 +499,14 @@ class WindowController:
         Cheaper and more direct than reading the foreground app, which answers
         about whatever happens to be on screen (a screen saver, a system dialog)
         rather than about the game.
+
+        pidof only knows the packages we name here, and modified Brawl Stars
+        builds ship under their own id - bsd.suitcase.nexusv2 here - so a list
+        of two names silently missed the game that was open in front of the
+        operator and the bot kept announcing that Brawl Stars was not running.
+        When none of the names answer, the foreground is asked instead, using
+        the same prefix rule the panel already trusts, and the package found
+        that way is written to the config so the next check is a cheap pidof.
         """
         for package in (self.BRAWL_STARS_PACKAGE, *KNOWN_BS_PACKAGES):
             try:
@@ -492,7 +516,33 @@ class WindowController:
                 print(f"Error checking whether '{package}' is running: {e}")
                 # Transport failure does not prove that the game process died.
                 raise
+        if is_brawl_stars_package(foreground_package(self.device)):
+            self._adopt_foreground_package()
+            return True
         return False
+
+    def _adopt_foreground_package(self):
+        """Remember which package the game actually runs under.
+
+        Without this every later launch and stop names a package the device does
+        not have, so the game is never really restarted when it does die.
+        """
+        try:
+            opened = foreground_package(self.device).strip()
+        except Exception as e:  # noqa: BLE001
+            print(f"Error reading the foreground package: {e}")
+            return
+        if not opened or opened == self.BRAWL_STARS_PACKAGE:
+            return
+        try:
+            general_config = load_toml_as_dict("cfg/general_config.toml")
+            general_config["brawl_stars_package"] = opened
+            save_dict_as_toml(general_config, "cfg/general_config.toml")
+            invalidate_toml_cache("cfg/general_config.toml")
+            self.BRAWL_STARS_PACKAGE = opened
+            print(f"Brawl Stars runs under '{opened}'. Saved that in the config.")
+        except Exception as e:  # noqa: BLE001
+            print(f"Could not save the detected Brawl Stars package: {e}")
 
     def restart_brawl_stars(self):
         self.device.app_stop(self.BRAWL_STARS_PACKAGE)
@@ -511,12 +561,8 @@ class WindowController:
                     break
             if detected_known_package:
                 if opened_app != self.BRAWL_STARS_PACKAGE:
-                    general_config = load_toml_as_dict("cfg/general_config.toml")
-                    general_config["brawl_stars_package"] = opened_app
-                    save_dict_as_toml(general_config, "cfg/general_config.toml")
-                    self.BRAWL_STARS_PACKAGE = opened_app
-                    invalidate_toml_cache("cfg/general_config.toml")
-                    print(f"Detected Brawl Stars running under the '{opened_app}' package. Updating configuration to match.")
+                    self._adopt_foreground_package()
+                return True
             return opened_app == self.BRAWL_STARS_PACKAGE.strip()
         except Exception as e:
             print(f"Error checking if Brawl Stars is running: {e}")
@@ -553,6 +599,7 @@ class WindowController:
             self.movement_joystick_x, self.movement_joystick_y = movement_joystick[0] * self.width_ratio, movement_joystick[1] * self.height_ratio
             self.original_movement_joystick = (self.movement_joystick_x, self.movement_joystick_y)
             self.scale_factor = min(self.width_ratio, self.height_ratio)
+        self.last_screenshot_time = frame_time
         return frame
 
     def reset_to_default_resolution(self):
@@ -561,7 +608,7 @@ class WindowController:
         self.height = brawl_stars_height
         self.width_ratio = self.width / brawl_stars_width
         self.height_ratio = self.height / brawl_stars_height
-        movement_joystick = press_coords_dict.get("movement_joystick", [180, 900])
+        movement_joystick = self.press_coords.get("movement_joystick", [180, 900])
         self.movement_joystick_x, self.movement_joystick_y = movement_joystick[0] * self.width_ratio, movement_joystick[1] * self.height_ratio
         self.original_movement_joystick = (self.movement_joystick_x, self.movement_joystick_y)
         self.scale_factor = min(self.width_ratio, self.height_ratio)

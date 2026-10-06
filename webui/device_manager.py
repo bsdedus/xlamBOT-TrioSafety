@@ -20,7 +20,7 @@ adb = BoundedAdbClient()
 import device_profiles
 from bot_instance import run_bot_instance
 from utils import clean_queue, config_scope
-from window_controller import get_device_by_serial, is_brawl_stars_package
+from window_controller import WindowController, get_device_by_serial, is_brawl_stars_package
 
 ANSI_CLEAN_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 MAX_LOG_LINES = 1500
@@ -132,10 +132,12 @@ class DeviceRuntimeManager:
         self.xlambot_main = xlambot_main
         self.discord_bot = discord_bot
         self._lock = threading.RLock()
-        self._start_lock = threading.Lock()
+        self._start_lock = threading.RLock()
         self._runtimes: dict[str, DeviceRuntime] = {}
         self._controls: dict[str, Any] = {}
         self._instances: dict[str, Any] = {}
+        # key -> (jpeg bytes, frame timestamp they came from, when encoded)
+        self._snapshots: dict[str, tuple[bytes, float, float]] = {}
         self._queue_provider: Callable[[str], list[dict[str, Any]]] | None = None
 
     def set_discord_bot(self, discord_bot):
@@ -503,8 +505,35 @@ class DeviceRuntimeManager:
         LOG_HUB.clear(device_profiles.sanitize_key(key))
 
     # -- live telemetry --------------------------------------------------------
-    def snapshot_jpeg(self, key: str, quality: int = 65) -> bytes:
-        """Encode the device's newest scrcpy frame as JPEG (empty when unavailable)."""
+    def preview_interval(self, key: str) -> float:
+        """Seconds between refreshed previews for one device.
+
+        0 means every request is encoded fresh. Read from the device's own
+        profile so one machine's choice does not decide for the others.
+        """
+        try:
+            from utils import load_toml_as_dict
+
+            with device_profiles.use_profile(key):
+                raw = load_toml_as_dict(
+                    "cfg/bot_config.toml").get("preview_interval_ms", 800)
+            return max(0.0, float(raw) / 1000.0)
+        except Exception:  # noqa: BLE001
+            return 0.8
+
+    def snapshot_jpeg(self, key: str, quality: int = 65, max_width: int = 480) -> bytes:
+        """The device's newest scrcpy frame as JPEG (empty when unavailable).
+
+        The frame is already in memory, so this costs a resize and an encode and
+        nothing on the device side. Encoding the full 1280x720 every time was
+        the reason the preview crawled, and the card shows it at about a fifth
+        of that width, so it is scaled down first.
+
+        Within the configured interval the previous picture is handed back
+        unchanged. That is what makes the setting honest: the panel can ask as
+        often as it likes and the refresh rate is still the one that was asked
+        for, on any client.
+        """
         key = device_profiles.sanitize_key(key)
         with self._lock:
             instance = self._instances.get(key)
@@ -516,7 +545,48 @@ class DeviceRuntimeManager:
             return b""
         if frame is None:
             return b""
-        return instance.window_controller.frame_to_jpeg(frame, quality=quality)
+
+        interval = self.preview_interval(key)
+        now = time.monotonic()
+        cached = self._snapshots.get(key)
+        if cached is not None:
+            data, seen_frame, at = cached
+            if now - at < interval:
+                return data
+            if seen_frame == frame_time:
+                # Nothing new on screen. Re-encoding the same picture would only
+                # burn CPU to produce the same bytes.
+                return data
+
+        data = instance.window_controller.frame_to_jpeg(
+            frame, quality=quality, max_width=max_width)
+        if data:
+            self._snapshots[key] = (data, frame_time, now)
+        return data
+
+    def instance_for(self, key: str):
+        """The running bot's own instance, or None when the bot is stopped.
+
+        Used by the training recorder: the frames it saves come from the same
+        scrcpy stream the bot is already receiving, so recording costs the game
+        nothing and no second connection is opened to the device.
+        """
+        with self._lock:
+            return self._instances.get(device_profiles.sanitize_key(key))
+
+    def save_frame_jpeg(self, key: str, frame, path) -> bool:
+        """Write one frame to disk as JPEG. Returns whether it got there."""
+        if frame is None:
+            return False
+        try:
+            encoded = WindowController.frame_to_jpeg(frame, quality=88)
+            if not encoded:
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(encoded)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
     def telemetry(self, key: str) -> dict[str, Any]:
         """Live progress of one device: state, brawler, trophies, fps counters."""
@@ -569,15 +639,17 @@ class DeviceRuntimeManager:
                     current_name = instance.Stage_manager.current_brawler()
                 except Exception:
                     current_name = None
-                data["brawler"] = current_name or queue[0].get("brawler")
+                data["brawler"] = current_name
+                data["brawler_confirmed"] = bool(current_name)
+                data["brawler_expected"] = queue[0].get("brawler")
                 current = next((e for e in queue
                                 if str(e.get("brawler", "")).lower() == str(data["brawler"]).lower()),
                                queue[0])
                 data["push_type"] = current.get("type")
                 data["push_until"] = current.get("push_until")
-                data["trophies"] = getattr(observer, "current_trophies", None)
-                data["wins"] = getattr(observer, "current_wins", None)
-                data["win_streak"] = getattr(observer, "win_streak", None)
+                data["trophies"] = getattr(observer, "current_trophies", None) if current_name else None
+                data["wins"] = getattr(observer, "current_wins", None) if current_name else None
+                data["win_streak"] = getattr(observer, "win_streak", None) if current_name else None
                 try:
                     # Rate is built on the account total, not the per-brawler
                     # number: the brawler count restarts on every switch and

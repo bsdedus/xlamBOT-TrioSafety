@@ -968,7 +968,7 @@ class Play:
     @staticmethod
     def validate_game_data(data):
         incomplete = False
-        if "player" not in data.keys():
+        if not data.get("player"):
             incomplete = True  # This is required so track_no_detections can also keep track if enemy is missing
 
         if "enemy" not in data.keys():

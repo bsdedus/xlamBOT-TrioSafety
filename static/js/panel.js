@@ -5,10 +5,10 @@
     const TOKEN = document.querySelector('meta[name="xlam-ui-token"]').content;
     const POLL_MS = 2000;
     const LOG_POLL_MS = 2500;
-    // The preview is a still image of a match; it does not need 2 Hz. Gas and the
-    // trophy rate change over minutes, so a slower preview is invisible and costs
-    // one frame grab plus one JPEG encode less per cycle.
-    const SNAPSHOT_POLL_MS = 5000;
+    // Only the wait before the first picture: from then on the server sends back
+    // the refresh rate it is actually enforcing (preview_interval_ms in the
+    // settings), so this is a starting guess rather than the setting itself.
+    const SNAPSHOT_POLL_MS = 800;
 
     const grid = document.getElementById('deviceGrid');
     const noDevices = document.getElementById('noDevices');
@@ -62,7 +62,7 @@
             headers['Content-Type'] = 'application/json';
             options.body = JSON.stringify(options.body);
         }
-        const response = await fetch(path, { method: options.method || 'GET', headers, body: options.body });
+        const response = await window.XlamSession.fetch(path, { method: options.method || 'GET', headers, body: options.body });
         const contentType = response.headers.get('content-type') || '';
         let payload = {};
         if (contentType.includes('application/json')) {
@@ -72,9 +72,9 @@
     }
 
     async function apiBlob(path) {
-        const response = await fetch(path, { headers: { 'X-Xlam-UI-Token': TOKEN } });
+        const response = await window.XlamSession.fetch(path, { headers: { 'X-Xlam-UI-Token': TOKEN } });
         if (!response.ok) return null;
-        return await response.blob();
+        return { blob: await response.blob(), headers: response.headers };
     }
 
     let toastTimer = null;
@@ -203,15 +203,34 @@
             </div>
 
             <div class="device-body">
+                ${device.mode_warning ? `<div class="warn-box">${escapeHtml(device.mode_warning)}</div>` : ''}
+                ${device.gas_warning ? `<div class="warn-box">${escapeHtml(device.gas_warning)}</div>` : ''}
                 ${runtime.last_error ? `<div class="error-box">${escapeHtml(runtime.last_error)}</div>` : ''}
 
                 <div class="controls">
-                    <button class="btn btn-primary" data-action="start" data-key="${escapeHtml(key)}" ${startDisabled ? 'disabled' : ''}>Старт</button>
+                    <a class="btn btn-ghost" href="/calibration/${encodeURIComponent(key)}">Калибровка бойцов</a>
+                    <button class="btn btn-primary" data-action="start" data-key="${escapeHtml(key)}" ${startDisabled ? 'disabled' : ''}><svg class="ui-icon" aria-hidden="true"><use href="#icon-player-play"/></svg>Старт</button>
                     <button class="btn ${pauseClass}" data-action="${pauseAction}" data-key="${escapeHtml(key)}" ${isRunning ? '' : 'disabled'}>${pauseLabel}</button>
                     <button class="btn btn-danger" data-action="stop" data-key="${escapeHtml(key)}" ${running ? '' : 'disabled'}>Стоп</button>
+                    <button class="btn btn-train" data-action="training" data-key="${escapeHtml(key)}"
+                            title="Записать матч и потом разметить кадры">Обучение</button>
                 </div>
 
-                <div class="rotate-bar">
+                <div class="training-row" data-training-row="${escapeHtml(key)}">
+                    <label class="training-count">
+                        кадров
+                        <input class="input training-count-input" type="number" min="1" max="400"
+                               step="1" value="10" data-training-count="${escapeHtml(key)}"
+                               title="Сколько кадров оставить из матча — они размажутся по всему матчу">
+                    </label>
+                    <span class="training-note" data-training-note="${escapeHtml(key)}"></span>
+                    <a class="btn btn-sm btn-ghost hidden" data-training-open="${escapeHtml(key)}"
+                       href="#" target="_blank" rel="noreferrer">Разметить</a>
+                    <button class="btn btn-sm btn-ghost hidden" data-action="training-stop"
+                            data-key="${escapeHtml(key)}">Прервать</button>
+                </div>
+
+                <div class="rotate-bar" data-rotate-bar="${escapeHtml(key)}">
                     <div class="rotate-field">
                         <label class="rotate-label" for="switch-after-${escapeHtml(key)}">Смена</label>
                         <input id="switch-after-${escapeHtml(key)}" class="input rotate-input"
@@ -223,7 +242,7 @@
                     <div class="rotate-field">
                         <label class="rotate-label" for="sort-mode-${escapeHtml(key)}">Сортировка</label>
                         <select id="sort-mode-${escapeHtml(key)}" class="input rotate-select"
-                                data-sort-mode="${escapeHtml(key)}"></select>
+                                data-sort-mode="${escapeHtml(key)}">${SORT_MODE_OPTIONS}</select>
                     </div>
                     <button class="btn btn-sm btn-primary" type="button"
                             data-action="save-rotate" data-key="${escapeHtml(key)}">Применить</button>
@@ -232,15 +251,17 @@
                 </div>
 
                 <div class="toggle-row">
-                    <details class="disclosure" data-queue-details="${escapeHtml(key)}">
-                        <summary>Очередь бойцов</summary>
-                        <div class="section-title">Бойцы выбираются автоматически</div>
-                        <div class="queue-list" data-queue="${escapeHtml(key)}">
+                    <details class="disclosure" data-brawler-details="${escapeHtml(key)}">
+                        <summary>Бойцы · ручной выбор</summary>
+                        <div class="section-title" data-brawler-title="${escapeHtml(key)}">Загрузка…</div>
+                        <div class="brawler-grid" data-brawler-grid="${escapeHtml(key)}">
                             <div class="queue-empty">Загрузка…</div>
                         </div>
                         <div class="auto-note">
-                            Сортировка по минимальным трофеям,
-                            <span data-switch-after="${escapeHtml(key)}">7</span> боёв на бойца, затем переключение.
+                            Нажмите на бойца — бот будет играть только на нём.
+                            <button class="btn btn-sm btn-ghost" type="button"
+                                    data-action="unlock-brawler" data-key="${escapeHtml(key)}">
+                                Отпустить, выбирать автоматически</button>
                         </div>
                     </details>
 
@@ -276,12 +297,41 @@
             cardKeys = signature;
             grid.innerHTML = devices.map(deviceCard).join('');
             devices.forEach((d) => {
-                if (queues[d.key]) renderQueue(d.key, queues[d.key], liveByKey[d.key]);
-                else loadQueue(d.key);
+                renderBrawlerGrid(d.key);
                 if (lastLogText[d.key]) renderLogs(d.key, lastLogText[d.key]);
+                applyStoredRotation(d.key);
             });
+            // Fetched after the cards exist so the grid has somewhere to draw.
+            devices.forEach((d) => applyLockedBrawler(d.key));
         }
         devices.forEach(updateCard);
+    }
+
+    /* Квота и сортировка хранятся в настройках устройства, а не в телеметрии.
+       Раньше поля заполнялись только из телеметрии, поэтому у остановленного
+       или упавшего бота «Смена» была пустой, а список сортировки - вовсе без
+       вариантов. Настройки читаются независимо от состояния бота, так что
+       поля показывают сохранённые значения всегда. */
+    async function applyStoredRotation(key) {
+        let settings = {};
+        try {
+            const { data } = await api(
+                `/api/devices/${encodeURIComponent(key)}/settings`);
+            settings = (data && data.settings) || {};
+        } catch (err) {
+            return;
+        }
+        const bot = settings.bot_config || {};
+        const input = grid.querySelector(`[data-switch-input="${cssEscape(key)}"]`);
+        if (input && document.activeElement !== input && bot.brawler_switch_after_games != null) {
+            input.value = bot.brawler_switch_after_games;
+            input.dataset.applied = String(bot.brawler_switch_after_games);
+        }
+        const select = grid.querySelector(`[data-sort-mode="${cssEscape(key)}"]`);
+        if (select && document.activeElement !== select && bot.brawler_pick_mode) {
+            select.value = bot.brawler_pick_mode;
+            select.dataset.applied = bot.brawler_pick_mode;
+        }
     }
 
     function updateCard(device) {
@@ -302,6 +352,25 @@
         if (badge) {
             badge.className = 'badge badge-' + (online ? escapeHtml(status) : 'offline');
             badge.textContent = online ? (STATE_LABELS[status] || status) : 'офлайн';
+        }
+
+        // The mode warning follows the settings, so it can change without the
+        // device list changing. Update it in place instead of leaving whatever
+        // was true when the card was first drawn.
+        const warnSlot = card.querySelector('.device-body');
+        if (warnSlot) {
+            let warn = warnSlot.querySelector('.warn-box');
+            const text = device.mode_warning || '';
+            if (text && (!warn || warn.textContent !== text)) {
+                if (!warn) {
+                    warn = document.createElement('div');
+                    warn.className = 'warn-box';
+                    warnSlot.insertBefore(warn, warnSlot.firstChild);
+                }
+                warn.textContent = text;
+            } else if (!text && warn) {
+                warn.remove();
+            }
         }
 
         const startBtn = card.querySelector('[data-action="start"]');
@@ -375,15 +444,23 @@
         { value: 'by_name', label: 'По имени' },
     ];
 
+    // Варианты сортировки печатаем прямо в разметке карточки. Раньше они
+    // добавлялись в renderTelemetry, и пока телеметрия не приходила, список
+    // оставался пустым: у человека с упавшим ботом поле выглядело как
+    // «сортировки нет», хотя сортировка настроена и работает.
+    const SORT_MODE_OPTIONS = SORT_MODES
+        .map((mode) => `<option value="${escapeHtml(mode.value)}">${escapeHtml(mode.label)}</option>`)
+        .join('');
+
     function renderTelemetry(key, telemetry) {
         const live = { brawler: telemetry.brawler, trophies: telemetry.trophies };
         const previous = liveByKey[key];
         const changed = !previous || previous.brawler !== live.brawler
             || previous.trophies !== live.trophies;
         liveByKey[key] = live;
-        // The queue row for the current brawler shows the live count, so it has to
-        // be redrawn whenever that count moves — not only when the queue loads.
-        if (changed && queues[key]) renderQueue(key, queues[key], live);
+        // The brawler grid marks the brawler actually being played, so it has to
+        // be redrawn whenever that changes - not only when the grid first loads.
+        if (changed) renderBrawlerGrid(key);
         const styleEl = grid.querySelector(`[data-playstyle="${cssEscape(key)}"]`);
         if (styleEl) {
             const style = telemetry.playstyle;
@@ -477,7 +554,6 @@
                   + `идут не каждый матч.`
                 : `Нужно ${needed} мин наблюдения, отсчётов: ${rate.samples}`;
         }
-        const switchEl = grid.querySelector(`[data-switch-after="${cssEscape(key)}"]`);
         const switchInput = grid.querySelector(`[data-switch-input="${cssEscape(key)}"]`);
         const switchHint = grid.querySelector(`#switch-after-hint-${cssEscape(key)}`);
         const sortSelect = grid.querySelector(`[data-sort-mode="${cssEscape(key)}"]`);
@@ -504,8 +580,7 @@
                 sortHint.className = 'rotate-hint' + (pending ? ' is-pending' : '');
             }
         }
-        if (switchEl && telemetry.switch_after_games != null) {
-            switchEl.textContent = telemetry.switch_after_games;
+        if (telemetry.switch_after_games != null) {
             if (switchInput && document.activeElement !== switchInput) {
                 // Don't fight the operator mid-typing.
                 switchInput.value = telemetry.switch_after_games;
@@ -636,38 +711,6 @@
             </div>`;
     }
 
-    function renderQueue(key, items, live) {
-        const container = grid.querySelector(`[data-queue="${cssEscape(key)}"]`);
-        if (!container) return;
-        const signature = JSON.stringify([items || [], live || null]);
-        if (container.dataset.sig === signature) return;
-        container.dataset.sig = signature;
-        if (!items || !items.length) {
-            container.innerHTML = '<div class="queue-empty">Очередь пуста — бот подберёт бойцов сам.</div>';
-            return;
-        }
-        container.innerHTML = items.map((item, index) => {
-            const matches = String(item.brawler).toLowerCase() === String((live && live.brawler) || '').toLowerCase();
-            // The badge used to hang off index === 0 while isLive was computed
-            // and thrown away. The game sorts the whole roster by least trophies,
-            // so the brawler actually being played is regularly not the one our
-            // queue put first, and the panel named the wrong row as "сейчас".
-            const isLive = !!live && matches;
-            const isFirst = index === 0;
-            const current = (isLive && live.trophies != null) ? live.trophies : (item.trophies || 0);
-            return `
-            <div class="queue-item${isLive ? ' is-current' : ''}">
-                <img class="queue-item-icon" src="/api/assets/brawlers/${encodeURIComponent(item.brawler)}" alt=""
-                     onerror="this.style.visibility='hidden'">
-                <div class="queue-item-body">
-                    <div class="queue-item-name">${escapeHtml(item.brawler)}</div>
-                    <div class="queue-item-target">${current} трофеев</div>
-                </div>
-                ${isLive ? '<span class="badge badge-running">сейчас</span>' : ''}
-            </div>`;
-        }).join('');
-    }
-
     function renderLogs(key, logs) {
         const box = grid.querySelector(`[data-logs="${cssEscape(key)}"]`);
         if (!box) return;
@@ -695,18 +738,109 @@
         return devices;
     }
 
+    // The roster, once, for every device. It used to be fetched and thrown away,
+    // which is why the panel could not show a brawler at all.
+    let brawlerCatalog = [];
+
     async function loadBrawlers() {
         const { data } = await api('/api/devices/brawlers');
+        if (data && Array.isArray(data.brawlers)) {
+            brawlerCatalog = data.brawlers;
+        }
+        return brawlerCatalog;
     }
 
-    const queues = {};
-    async function loadQueue(key) {
-        const { data } = await api(`/api/devices/${encodeURIComponent(key)}/queue`);
-        if (data && Array.isArray(data.items)) {
-            queues[key] = data.items;
-            renderQueue(key, data.items);
+    // key -> the brawler this device is locked to, "" when it rotates.
+    const lockedBrawlers = {};
+
+    function brawlerLabel(name) {
+        const found = brawlerCatalog.find((b) => String(b.name).toLowerCase() === String(name).toLowerCase());
+        if (!found) return name || '';
+        const title = found.name.replace(/_/g, ' ');
+        return title.charAt(0).toUpperCase() + title.slice(1);
+    }
+
+    function renderBrawlerGrid(key) {
+        const container = grid.querySelector(`[data-brawler-grid="${cssEscape(key)}"]`);
+        const title = grid.querySelector(`[data-brawler-title="${cssEscape(key)}"]`);
+        if (!container) return;
+        const locked = (lockedBrawlers[key] || '').toLowerCase();
+        const live = String((liveByKey[key] && liveByKey[key].brawler) || '').toLowerCase();
+        if (title) {
+            title.textContent = locked
+                ? `Играет только на: ${brawlerLabel(locked)}`
+                : 'Боец выбирается автоматически по сортировке';
         }
-        return queues[key] || [];
+        const signature = `${locked}|${live}`;
+        if (container.dataset.sig === signature) return;
+        container.dataset.sig = signature;
+        if (!brawlerCatalog.length) {
+            container.innerHTML = '<div class="queue-empty">Каталог бойцов недоступен.</div>';
+            return;
+        }
+        container.innerHTML = brawlerCatalog.map((entry) => {
+            const name = String(entry.name || '');
+            const key2 = name.toLowerCase();
+            const cls = ['brawler-cell'];
+            if (key2 === locked) cls.push('is-locked');
+            if (key2 === live) cls.push('is-live');
+            return `<button class="${cls.join(' ')}" type="button"
+                            data-action="lock-brawler" data-key="${escapeHtml(key)}"
+                            data-brawler="${escapeHtml(name)}"
+                            title="${escapeHtml(name)}">
+                        <img src="${escapeHtml(entry.icon_url || `/api/assets/brawlers/${encodeURIComponent(name)}`)}"
+                             alt="${escapeHtml(name)}" loading="lazy"
+                             onerror="this.style.visibility='hidden'">
+                        <span class="brawler-cell-name">${escapeHtml(brawlerLabel(name))}</span>
+                    </button>`;
+        }).join('');
+    }
+
+    async function applyLockedBrawler(key) {
+        try {
+            const { data } = await api(`/api/devices/${encodeURIComponent(key)}/brawler`);
+            lockedBrawlers[key] = (data && data.locked_brawler) || '';
+        } catch (err) {
+            lockedBrawlers[key] = '';
+        }
+        renderBrawlerGrid(key);
+        return lockedBrawlers[key] || '';
+    }
+
+    async function setLockedBrawler(key, name) {
+        const card = grid.querySelector(`[data-key="${cssEscape(key)}"]`);
+        if (card) card.classList.add('is-busy');
+        try {
+            const { ok, data } = await api(`/api/devices/${encodeURIComponent(key)}/brawler`, {
+                method: 'POST',
+                body: { brawler: name || '' },
+            });
+            if (!ok) {
+                toast(data && data.message ? data.message : 'Не удалось выбрать бойца', 'error');
+                return false;
+            }
+            lockedBrawlers[key] = (data && data.locked_brawler) || '';
+            renderBrawlerGrid(key);
+            renderRotationVisibility(key);
+            toast(name ? `Бот будет играть только на ${brawlerLabel(name)}`
+                : 'Бот снова выбирает бойца сам', 'ok');
+            return true;
+        } catch (err) {
+            toast('Не удалось выбрать бойца: ' + err.message, 'error');
+            return false;
+        } finally {
+            if (card) card.classList.remove('is-busy');
+        }
+    }
+
+    // The quota and the sort only mean something while the bot is choosing. With
+    // one brawler locked they are inert, and leaving them on screen next to a
+    // choice that overrides them is how you end up not knowing which is in force.
+    function renderRotationVisibility(key) {
+        const bar = grid.querySelector(`[data-rotate-bar="${cssEscape(key)}"]`);
+        if (!bar) return;
+        const locked = !!(lockedBrawlers[key] || '');
+        bar.classList.toggle('hidden', locked);
     }
 
     function runtimeStateOf(key) {
@@ -730,6 +864,13 @@
     const snapshotUrls = {};
     const snapshotBusy = {};
 
+    // How often to ask again. The server sends back the interval it is actually
+    // enforcing, so the refresh rate is the one set in the panel's settings and
+    // not a number guessed here. A 0 there means "as fast as a round trip
+    // allows", so a small floor keeps this from turning into a tight loop that
+    // re-downloads the same picture.
+    let snapshotWaitMs = SNAPSHOT_POLL_MS;
+
     async function loadSnapshots() {
         await Promise.all(devices.map(async (device) => {
             if (!device.runtime || !device.runtime.is_running) return;
@@ -741,12 +882,17 @@
             if (snapshotBusy[key]) return;
             snapshotBusy[key] = true;
             try {
-                const blob = await apiBlob(`/api/devices/${encodeURIComponent(key)}/snapshot`);
+                const got = await apiBlob(`/api/devices/${encodeURIComponent(key)}/snapshot`);
+                if (!got) return;
+                const told = Number(got.headers.get('X-Preview-Interval-Ms'));
+                if (!Number.isNaN(told)) {
+                    snapshotWaitMs = told <= 0 ? 150 : Math.min(5000, Math.max(120, told));
+                }
                 const img = grid.querySelector(`[data-preview="${cssEscape(key)}"]`);
                 const placeholder = grid.querySelector(`[data-placeholder="${cssEscape(key)}"]`);
-                if (!img || !blob) return;
+                if (!img) return;
                 if (snapshotUrls[key]) URL.revokeObjectURL(snapshotUrls[key]);
-                snapshotUrls[key] = URL.createObjectURL(blob);
+                snapshotUrls[key] = URL.createObjectURL(got.blob);
                 img.src = snapshotUrls[key];
                 img.style.display = 'block';
                 if (placeholder) placeholder.style.display = 'none';
@@ -779,6 +925,26 @@
         const action = button.dataset.action;
         if (!key) return;
 
+        // Choosing a brawler is a single click on a cell, not a submit: it must
+        // not run through the busy-button path below, which disables the element
+        // it was called on and would leave one cell stuck after the redraw.
+        if (action === 'training' || action === 'training-stop') {
+            await toggleTraining(key);
+            return;
+        }
+        if (action === 'lock-brawler') {
+            const name = button.dataset.brawler || '';
+            if (String(lockedBrawlers[key] || '').toLowerCase() === name.toLowerCase()) return;
+            const done = await setLockedBrawler(key, name);
+            if (done) await loadDevices();
+            return;
+        }
+        if (action === 'unlock-brawler') {
+            const done = await setLockedBrawler(key, '');
+            if (done) await loadDevices();
+            return;
+        }
+
         // Пока запрос уходит, кнопка не берёт повторный клик. Для «Старт» это
         // ещё и защита от двух ботов на одном устройстве.
         button.classList.add('is-busy');
@@ -789,7 +955,7 @@
                 const { data } = await api(`/api/devices/${encodeURIComponent(key)}/${action}`, { method: 'POST' });
                 if (data && data.message) toast(data.message, data.ok ? 'ok' : 'error');
                 await loadDevices();
-                if (action === 'start') await loadQueue(key);
+                if (action === 'start') await applyLockedBrawler(key);
             } else if (action === 'save-rotate') {
                 // One button for the whole row. Applies only what actually
                 // changed, so a stray click cannot rewrite the other setting.
@@ -895,7 +1061,7 @@
 
     document.getElementById('refreshBtn').addEventListener('click', async () => {
         await loadDevices();
-        for (const device of devices) await loadQueue(device.key);
+        for (const device of devices) await applyLockedBrawler(device.key);
         toast('Обновлено', 'ok');
     });
 
@@ -906,7 +1072,7 @@
             if (data && !data.ok && data.message) toast(data.message, 'error');
         }
         await loadDevices();
-        for (const device of devices) await loadQueue(device.key);
+        for (const device of devices) await applyLockedBrawler(device.key);
     });
 
     document.getElementById('stopAllBtn').addEventListener('click', async () => {
@@ -956,6 +1122,81 @@
         }
     }
 
+    /* ------------------------------------------------------------- обучение */
+    /* Запись идёт в фоне, панель только показывает её состояние и предлагает
+       открыть разметку. Раз в пять секунд: чаще незачем, а карточка и так
+       обновляется каждые две. */
+
+    async function refreshTraining() {
+        for (const device of devices) {
+            const note = grid.querySelector(`[data-training-note="${cssEscape(device.key)}"]`);
+            const open = grid.querySelector(`[data-action="training-stop"]`
+                + `[data-key="${cssEscape(device.key)}"]`) || grid.querySelector(
+                `[data-training-open="${cssEscape(device.key)}"]`)?.closest('div');
+            const stopBtn = grid.querySelector(`[data-action="training-stop"]`
+                + `[data-key="${cssEscape(device.key)}"]`);
+            const openLink = grid.querySelector(`[data-training-open="${cssEscape(device.key)}"]`);
+            try {
+                const { data } = await api(`/api/devices/${encodeURIComponent(device.key)}/training`);
+                const current = data.current;
+                const last = (data.sessions || [])[0];
+                if (current && current.recording) {
+                    if (note) note.textContent = `Идёт запись: ${current.frames} из ${current.recorded}`
+                        + (current.frame_count ? ` (оставлю ${current.frame_count})` : '');
+                    if (stopBtn) stopBtn.classList.remove('hidden');
+                    if (openLink) openLink.classList.add('hidden');
+                } else if (last) {
+                    if (note) {
+                        note.textContent = `Записано ${last.recorded}, оставлено ${last.frames}`
+                            + (last.checked ? ` · размечено ${last.checked}` : ' · не размечено');
+                    }
+                    if (stopBtn) stopBtn.classList.add('hidden');
+                    if (openLink) {
+                        openLink.href = `/training/${encodeURIComponent(last.id)}`;
+                        openLink.classList.remove('hidden');
+                    }
+                } else if (note) {
+                    note.textContent = '';
+                }
+            } catch (err) {
+                if (note) note.textContent = '';
+            }
+            void open;
+        }
+    }
+
+    async function toggleTraining(key) {
+        const stopBtn = grid.querySelector(`[data-action="training-stop"][data-key="${cssEscape(key)}"]`);
+        const note = grid.querySelector(`[data-training-note="${cssEscape(key)}"]`);
+        if (stopBtn && !stopBtn.classList.contains('hidden')) {
+            await api(`/api/devices/${encodeURIComponent(key)}/training/stop`, { method: 'POST' });
+            toast('Запись прервана', 'ok');
+            await refreshTraining();
+            return;
+        }
+        if (note) note.textContent = 'Запускаю бота…';
+        const countInput = grid.querySelector(`[data-training-count="${cssEscape(key)}"]`);
+        let frameCount = 10;
+        if (countInput) {
+            const value = Number(countInput.value);
+            if (Number.isFinite(value) && value >= 1) frameCount = Math.min(400, Math.round(value));
+        }
+        const { ok, data } = await api(`/api/devices/${encodeURIComponent(key)}/training/start`, {
+            method: 'POST',
+            body: { interval: 3, frame_count: frameCount },
+        });
+        if (!ok) {
+            toast(data && data.message ? data.message : 'Не удалось начать запись', 'error');
+            if (note) note.textContent = '';
+            return;
+        }
+        toast(data.started_bot
+            ? 'Бот запущен, идёт запись матча'
+            : 'Идёт запись матча', 'ok');
+        await loadDevices();
+        await refreshTraining();
+    }
+
     // A dead API used to freeze the panel on stale numbers with no hint at all:
     // the card simply stopped changing and still looked perfectly healthy.
     setInterval(() => {
@@ -974,9 +1215,16 @@
     async function init() {
         await loadBrawlers();
         await loadDevices();
-        for (const device of devices) await loadQueue(device.key);
+        for (const device of devices) await applyLockedBrawler(device.key);
         setInterval(cycle, POLL_MS);
-        setInterval(snapshotCycle, SNAPSHOT_POLL_MS);
+        // Chained rather than on a fixed interval, so changing the refresh rate
+        // takes effect on the next picture instead of at the next tick of a
+        // timer that was set when the page loaded.
+        const snapshotLoop = async () => {
+            await snapshotCycle();
+            setTimeout(snapshotLoop, snapshotWaitMs);
+        };
+        snapshotLoop();
         setInterval(loadLogs, LOG_POLL_MS);
     }
 

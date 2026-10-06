@@ -112,11 +112,16 @@ def read_settings(key: str) -> dict[str, Any]:
 
 def update_settings(key: str, section: str, updates: dict[str, Any]) -> dict[str, Any]:
     """Merge values into one section of one toml file and write it back."""
-    name = Path(section).name
-    if not utils.resolve_project_path('cfg', name).is_file() or not name.endswith('.toml'):
-        raise ValueError(f'Unknown config section: {section}')
-    section = f'cfg/{name}'
     ensure_profile(key)
+    match = re.fullmatch(r'(?:cfg[/\\])?([A-Za-z0-9_-]+?)(?:\.toml)?', str(section or '').strip(), re.I)
+    if not match:
+        raise ValueError('Invalid settings section')
+    filename = match.group(1).lower() + '.toml'
+    allowed = {p.name.lower() for p in utils.resolve_project_path('cfg').glob('*.toml')}
+    allowed.update(p.name.lower() for p in config_root_for(key).glob('*.toml'))
+    if filename not in allowed:
+        raise ValueError('Unknown settings section: ' + filename)
+    section = 'cfg/' + filename
     with use_profile(key):
         current = utils.load_toml_as_dict(section) if section else {}
         merged = dict(current or {})
@@ -137,8 +142,7 @@ def read_profile_meta(key: str) -> dict[str, Any]:
     """Free-form notes about a device, stored beside its config."""
     path = profile_dir(key) / "profile.json"
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
+        data = json.loads(utils.read_text_auto(path))
         return data if isinstance(data, dict) else {}
     except Exception:  # noqa: BLE001
         return {}

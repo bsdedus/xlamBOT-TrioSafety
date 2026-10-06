@@ -37,11 +37,15 @@ class StageManager:
         # Which card of the sorted grid to take this time. The first card
         # stays the same brawler for dozens of matches on this account, so
         # the position has to move for the switch to mean anything.
-        self._rotation_card = 0
         # What the last rotation actually did, so the panel can show proof
         # of the switch instead of only the current brawler.
         self._last_switch = None
         self.trio_session_confirmed = False
+        # Which brawler the one-brawler mode has already put us on, and whether
+        # that pick was confirmed. start_game is called on every lobby tick, so
+        # without this the menu would be reopened constantly.
+        self._lock_name = None
+        self._lock_ok = False
         # The lobby counters are read once per visit, not on every tick: the
         # read is OCR and the lobby is reported several times a second.
         self._lobby_synced = False
@@ -123,11 +127,98 @@ class StageManager:
 
     def _switch_after_games(self):
         """How many games to spend on one brawler; 0 disables the rotation."""
+        if self.locked_brawler():
+            # A locked brawler has no quota: it is the whole plan. Leaving the
+            # counter live would rotate away from it on the next match, which is
+            # the exact opposite of what was asked for.
+            return 0
         raw = load_toml_as_dict("./cfg/bot_config.toml").get("brawler_switch_after_games", 7)
         try:
             return max(0, int(raw))
         except (TypeError, ValueError):
             return 7
+
+    def locked_brawler(self):
+        """The one brawler to play, or "" when the normal rotation is wanted."""
+        raw = load_toml_as_dict("./cfg/bot_config.toml").get("locked_brawler", "") or ""
+        return str(raw).strip().lower()
+
+    def _lock_queue_to(self, name):
+        """Keep exactly one brawler in the queue: the chosen one.
+
+        The queue is still what the rest of the code reads - the trophy observer,
+        the push target, the panel - so locking means shrinking it to one entry
+        rather than teaching everything a second shape of input. The trophies we
+        already knew are carried over, so the per-hour rate keeps its history
+        instead of restarting at zero.
+        """
+        current = self.brawlers_pick_data[0] if self.brawlers_pick_data else None
+        if current and str(current.get("brawler", "")).strip().lower() == name:
+            return False
+        trophies = 0
+        wins = 0
+        for entry in self.brawlers_pick_data:
+            if str(entry.get("brawler", "")).strip().lower() == name:
+                trophies = entry.get("trophies") or 0
+                wins = entry.get("wins") or 0
+                break
+        self.brawlers_pick_data = [{
+            "brawler": name,
+            "type": "trophies",
+            # Far above anything a push can reach: the target branch must not
+            # fire, and the bot must not stop itself for finishing a goal that
+            # was never set.
+            "push_until": 100000,
+            "trophies": trophies,
+            "wins": wins,
+            "win_streak": 0,
+            "automatically_pick": True,
+        }]
+        print(f"Playing one brawler only: {name}.")
+        return True
+
+    def _select_locked_brawler(self, name):
+        """Pick the locked brawler in the menu, a bounded number of times.
+
+        start_game runs on every lobby tick, so an unguarded call here would
+        reopen the brawler menu every couple of seconds forever. The choice is
+        remembered instead: made once, and only redone if the game is later seen
+        on somebody else.
+        """
+        if self._lock_name != name:
+            self._lock_name = name
+            self._lock_ok = False
+        if self._lock_ok:
+            return
+        current = self.current_brawler()
+        if current and str(current).strip().lower() == name:
+            self._lock_ok = True
+            return
+
+        previous = current
+        result = self.Lobby_automation.select_brawler(
+            name, self.get_latest_state, runtime_control=self.runtime_control)
+        for _try in range(self.BRAWLER_PICK_ATTEMPTS):
+            if result not in ("failed", "error", "aborted", "stuck"):
+                break
+            if self._should_stop() or self._should_pause():
+                return
+            print(f"Selecting {name} returned {result!r}, attempt {_try + 1} "
+                  f"of {self.BRAWLER_PICK_ATTEMPTS}")
+            if self._sleep_interruptible(2):
+                return
+            result = self.Lobby_automation.select_brawler(
+                name, self.get_latest_state, runtime_control=self.runtime_control)
+
+        if result == "success":
+            self._lock_ok = True
+            self._adopt_picked_brawler(previous, 0)
+            print(f"On {name}, and staying on it.")
+        elif result in ("aborted", "stuck"):
+            self._lock_ok = False
+        else:
+            print(f"Could not pick {name} ({result!r}). The next lobby tick "
+                  "will try again.")
 
     def _rotation_list(self):
         """Optional explicit rotation; empty means the game's own sort decides."""
@@ -138,7 +229,11 @@ class StageManager:
     # itself, so none of them needs forty card reads to find the minimum.
     # Three columns by three rows, measured on a screenshot of the brawler menu.
     # The fourth column is cut off by the screen edge, so it is not usable.
-    CARD_GRID_SIZE = 9
+
+    # Сколько раз подряд можно повторять выбор бойца, прежде чем сдаться.
+    # Раньше повторов не было вовсе, и на несовместимой сортировке бот висел
+    # в меню выбора бесконечно.
+    BRAWLER_PICK_ATTEMPTS = 3
 
     BRAWLER_SORT_MODES = {
         "lowest_trophies": "brawlers_sort_least_trophies",
@@ -227,6 +322,7 @@ class StageManager:
         trophies = picked.get("trophies")
         sort_mode = self.brawler_sort_mode()
         if not name:
+            self._confirmed_brawler = None
             # The switch did happen on screen, we just could not read which
             # brawler it was. Saying so beats pretending nothing changed.
             self._last_switch = {
@@ -282,52 +378,45 @@ class StageManager:
         self.Trophy_observer.win_streak = entry.get("win_streak", 0)
 
     def sync_trophies_from_screen(self):
-        """Read the two lobby counters and feed the per-hour rate.
-
-        The account total is the one that can carry a rate: the per-brawler
-        number restarts on every switch and contradicts the brawler screen. The
-        lobby counter also belongs to the brawler the game has selected, which is
-        not necessarily the first entry of our queue.
-        """
         try:
             import trophy_reader
-        except Exception:  # noqa: BLE001
+            if not trophy_reader.available():
+                return None
+            frame = self.window_controller.screenshot()
+            try:
+                total = trophy_reader.read_account_total(frame, expected=self.Trophy_observer.account_total)
+                if total is not None:
+                    self.Trophy_observer.record_account_total(total)
+            except Exception as error:
+                print('Account OCR failed: ' + str(error))
+            real = trophy_reader.read(frame)
+            if isinstance(real, bool) or not isinstance(real, int) or not 0 <= real <= 10000:
+                if real is not None:
+                    print('Ignoring invalid brawler OCR: ' + str(real))
+                return None
+            name = str(self.current_brawler() or '').strip().lower()
+            if not name:
+                return None
+            entry = next((e for e in self.brawlers_pick_data if str(e.get('brawler', '')).strip().lower() == name), None)
+            previous = self._entry_trophies(entry) if entry is not None else None
+            # Do not accept a large rebase or an initial value on a single frame.
+            if previous is None or abs(real - previous) > 100:
+                pending = getattr(self, '_ocr_trophy_pending', None)
+                self._ocr_trophy_pending = (name, real)
+                if pending != (name, real):
+                    print('Brawler OCR needs a second matching observation: ' + str(real))
+                    return None
+            self._ocr_trophy_pending = None
+            if entry is None:
+                entry = {'brawler': name, 'type': 'trophies', 'push_until': 1000, 'trophies': real, 'wins': 0, 'win_streak': 0, 'automatically_pick': True}
+                self.brawlers_pick_data.insert(0, entry)
+            elif abs(real - previous) > 5:
+                entry['trophies'] = real
+                print('Confirmed brawler OCR: ' + name + ' ' + str(previous) + ' -> ' + str(real))
+            return real
+        except Exception as error:
+            print('Brawler OCR synchronization failed: ' + str(error))
             return None
-        if not trophy_reader.available():
-            return None
-        frame = self.window_controller.screenshot()
-        try:
-            # The last known total disambiguates which number in the top strip
-            # is ours; without it the reader can settle on a neighbour.
-            total = trophy_reader.read_account_total(
-                frame, expected=self.Trophy_observer.account_total)
-            if total is not None:
-                self.Trophy_observer.record_account_total(total)
-        except Exception:  # noqa: BLE001
-            pass
-        real = trophy_reader.read(frame)
-        if real is None:
-            return real
-        name = self.current_brawler()
-        if not name:
-            return real
-        stored = None
-        for entry in self.brawlers_pick_data:
-            if str(entry.get("brawler", "")).lower() == str(name).lower():
-                stored = self._entry_trophies(entry)
-                break
-        if stored is None:
-            entry = {"brawler": name, "type": "trophies", "push_until": 1000,
-                     "trophies": real, "wins": 0, "win_streak": 0,
-                     "automatically_pick": True}
-            self.brawlers_pick_data.insert(0, entry)
-            print(f"Playing {name}, which was not in the queue; added it at {real} trophies.")
-            return real
-        if abs(real - stored) > 5:
-            print(f"Trophies read from the lobby: {real} (last known {stored}) "
-                  f"for {name}. Display only; nothing decides on it.")
-            entry["trophies"] = real
-        return real
 
     def rotate_to_lowest_trophies(self):
         """Move the brawler with the fewest trophies to the front of the queue."""
@@ -376,6 +465,16 @@ class StageManager:
             return
 
         print("state is lobby, starting game")
+        locked = self.locked_brawler()
+        if locked:
+            # One brawler, chosen by the operator. The queue shrinks to it and
+            # the menu is used to actually get on it, because the game's own
+            # sort would otherwise hand back somebody else.
+            self._lock_queue_to(locked)
+            self._select_locked_brawler(locked)
+            if not self._lock_ok or self._should_stop() or self._should_pause():
+                self.window_controller.release_all_inputs()
+                return
         values = {
             "trophies": self.Trophy_observer.current_trophies,
             "wins": self.Trophy_observer.current_wins
@@ -392,7 +491,10 @@ class StageManager:
         # sys.exit() and stop. The game already sorts by "Least Trophies" and
         # picks the real minimum, so the only fact the bot needs is the name of
         # the brawler that got selected.
-        if USE_TROPHY_TARGETS and value >= push_current_brawler_till:
+        if USE_TROPHY_TARGETS and value >= push_current_brawler_till and not locked:
+            # and not locked: with one brawler chosen there is no next one to move
+            # on to, and this branch's single-entry case calls sys.exit(), which
+            # would stop a bot that is doing exactly what it was asked to do.
             if len(self.brawlers_pick_data) <= 1:
                 print("Brawler reached required trophies/wins. No more brawlers selected for pushing in the menu. "
                       "Bot will now pause itself until closed.", value, push_current_brawler_till)
@@ -411,18 +513,38 @@ class StageManager:
             next_brawler_name = self.brawlers_pick_data[0]['brawler']
             if self.brawlers_pick_data[0]["automatically_pick"]:
                 select_brawler = self.Lobby_automation.select_brawler(next_brawler_name, self.get_latest_state, runtime_control=self.runtime_control)
-                while select_brawler in ["failed", "error"]:
+                # Повторов было безгранично много, а боец ниже кладётся обратно
+                # в очередь, поэтому повторялся ровно тот же выбор: на
+                # сортировке, не совпадающей с порядком очереди, бот так и висел
+                # в меню выбора бойца. Считаем попытки и уходим.
+                for _try in range(self.BRAWLER_PICK_ATTEMPTS):
+                    if select_brawler not in ("failed", "error", "aborted", "stuck"):
+                        break
                     if self.ping_when_stuck:
                         screenshot = self.window_controller.screenshot()
                         notify_user("bot_failed_brawler_selection", screenshot, self)
-                        print(f"Skipping {select_brawler}")
                     if self._should_stop() or self._should_pause():
                         return
-                    current_brawler = self.brawlers_pick_data.pop(0)
-                    self.brawlers_pick_data.append(current_brawler)
-                    next_brawler_name = self.brawlers_pick_data[0]['brawler']
+                    print(f"Skipping {select_brawler}, attempt {_try + 1} "
+                          f"of {self.BRAWLER_PICK_ATTEMPTS}")
+                    if self._sleep_interruptible(2):
+                        return
+                    # Уводим непокорного бойца в конец очереди, иначе повтор
+                    # был бы тем же самым выбором.
                     self.quit_shop()
-                    select_brawler = self.Lobby_automation.select_brawler(next_brawler_name, self.get_latest_state, runtime_control=self.runtime_control)
+                    stuck = self.brawlers_pick_data.pop(0)
+                    self.brawlers_pick_data.append(stuck)
+                    if len(self.brawlers_pick_data) > 1:
+                        self.brawlers_pick_data.insert(
+                            0, self.brawlers_pick_data.pop(1))
+                    next_brawler_name = self.brawlers_pick_data[0]['brawler']
+                    select_brawler = self.Lobby_automation.select_brawler(
+                        next_brawler_name, self.get_latest_state,
+                        runtime_control=self.runtime_control)
+                else:
+                    print(f"Brawler selection failed after {self.BRAWLER_PICK_ATTEMPTS} "
+                          "attempts; continuing without a switch instead of "
+                          "retrying forever.")
                 if select_brawler == "aborted" or select_brawler == "stuck":
                     return
                 if select_brawler == "success":
@@ -474,7 +596,7 @@ class StageManager:
                         select_brawler = self.Lobby_automation.select_brawler_by_sort(
                             self.get_latest_state, runtime_control=self.runtime_control,
                             sort_point=self.brawler_sort_point(),
-                            card_index=self._rotation_card)
+                            card_index=0)
                         for _attempt in range(3):
                             # None used to slip through this test and end the
                             # retries at once, so a menu that failed to open was
@@ -493,45 +615,10 @@ class StageManager:
                             select_brawler = self.Lobby_automation.select_brawler_by_sort(
                                         self.get_latest_state, runtime_control=self.runtime_control,
                                         sort_point=self.brawler_sort_point(),
-                                        card_index=self._rotation_card)
+                                        card_index=0)
                         if select_brawler in ("aborted", "stuck"):
                             return
                         if select_brawler == "success":
-                            # Walk the grid until the card names somebody other
-                            # than the brawler we are already on. The game's own
-                            # sort cannot do this on its own: one brawler sits far
-                            # below the rest of the roster, so it stays first for
-                            # dozens of matches and the quota never moves anybody.
-                            for _step in range(self.CARD_GRID_SIZE):
-                                if select_brawler == "success":
-                                    name = (
-                                        getattr(self.Lobby_automation,
-                                                "last_picked", None) or {}
-                                    ).get("brawler")
-                                    if (not name
-                                            or not previous
-                                            or str(name).strip().lower()
-                                            != str(previous).strip().lower()):
-                                        break
-                                    self._rotation_card = (
-                                        (self._rotation_card + 1) % self.CARD_GRID_SIZE)
-                                    print(f"Card at this position is {name}, the "
-                                          f"brawler already played; taking the next "
-                                          f"one, position {self._rotation_card}.")
-                                    if self._should_stop() or self._should_pause():
-                                        return
-                                    if self._sleep_interruptible(1.2):
-                                        return
-                                    select_brawler = \
-                                        self.Lobby_automation.select_brawler_by_sort(
-                                            self.get_latest_state,
-                                            runtime_control=self.runtime_control,
-                                            sort_point=self.brawler_sort_point(),
-                                            card_index=self._rotation_card)
-                                else:
-                                    break
-                            self._rotation_card = (
-                                (self._rotation_card + 1) % self.CARD_GRID_SIZE)
                             self._adopt_picked_brawler(previous, switch_after)
                             # Only now is the quota really spent.
                             self.games_on_current_brawler = 0
@@ -597,24 +684,26 @@ class StageManager:
                 raw_found_result = '_'.join(current_state.split("_")[1:])
                 parsed_result = self.Trophy_observer.parse_game_result(raw_found_result)
 
-                current_brawler = self.brawlers_pick_data[0]['brawler']
+                current_brawler = self.current_brawler()
+                entry = next((e for e in self.brawlers_pick_data
+                              if str(e.get('brawler', '')).lower() == str(current_brawler or '').lower()), None)
                 power_level = None
                 underdog = is_underdog(screenshot)
                 if underdog:
                     print("Underdog detected for this match.")
-                self.Trophy_observer.add_trophies(parsed_result, current_brawler, self.playstyle_info, underdog, power_level,
-                                                 observed_delta=observed_delta)
-                self.Trophy_observer.add_win(parsed_result)
                 self.time_since_last_stat_change = time.time()
-                values = {
-                    "trophies": self.Trophy_observer.current_trophies,
-                    "wins": self.Trophy_observer.current_wins
-                }
-                type_to_push = self.brawlers_pick_data[0]['type']
-                value = values[type_to_push]
-                self.brawlers_pick_data[0][type_to_push] = value
-                self.brawlers_pick_data[0]['win_streak'] = self.Trophy_observer.win_streak
-                save_brawler_data(self.brawlers_pick_data)
+                if entry is not None and current_brawler:
+                    self.Trophy_observer.add_trophies(parsed_result, current_brawler, self.playstyle_info, underdog, power_level,
+                                                     observed_delta=observed_delta)
+                    self.Trophy_observer.add_win(parsed_result)
+                    values = {'trophies': self.Trophy_observer.current_trophies,
+                              'wins': self.Trophy_observer.current_wins}
+                    type_to_push = entry['type']
+                    entry[type_to_push] = values[type_to_push]
+                    entry['win_streak'] = self.Trophy_observer.win_streak
+                    save_brawler_data(self.brawlers_pick_data)
+                else:
+                    print('Brawler identity is unconfirmed; per-brawler statistics were not changed.')
 
             if not button_pressed and self.play_again_on_win and parsed_result and parsed_result.result == MatchResult.VICTORY and not self._should_pause() and not self._should_stop():
                 self.window_controller.press("play_again")

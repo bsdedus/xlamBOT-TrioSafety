@@ -26,7 +26,6 @@ import time
 import webbrowser
 
 APP_NAME = "xlamBOT"
-from version import __version__ as VERSION
 DEFAULT_PORT = 5195
 WIZARD_MARKER = "setup_done.json"
 
@@ -104,6 +103,10 @@ def open_ui(url: str) -> None:
 
 def main() -> int:
     root = bundled_root()
+    os.environ['XLAMBOT_BUNDLE_ROOT'] = root
+    import update_client
+    update_client.activate()
+    from version import __version__ as VERSION
     from utils import DATA_ROOT, initialize_user_data
     initialize_user_data()
     os.chdir(DATA_ROOT)
@@ -188,6 +191,8 @@ def main() -> int:
         from werkzeug.serving import make_server
         server = make_server('127.0.0.1', port, app, threaded=True)
         app.extensions['shutdown_server'] = server.shutdown
+        update_client.mark_healthy()
+        threading.Thread(target=app.config['update_manager'].loop, daemon=True, name='xlambot-signed-updater').start()
         try:
             server.serve_forever()
         finally:
