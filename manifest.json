@@ -2,11 +2,11 @@
   "manifest": {
     "repository": "bsdedus/xlamBOT-TrioSafety",
     "bootstrap": 1,
-    "revision": 2,
+    "revision": 3,
     "version": "0.8.18.post1",
     "python": "3.12",
-    "size": 418951,
-    "sha256": "e39c97fc9b371dfebc8c113ba8f30f88e62b586b80a24aa22777cc9e8daa8514",
+    "size": 418946,
+    "sha256": "6fc794d547a8ebb0f8541d36edf7eed65b6d7464d2093a28d61e86f897749bbe",
     "files": {
       "adb_connection.py": "6de3eec05c98177ac4aedbeee683fe56c8991588ca80a224af6cc8ec76388a2d",
       "api/api.py": "2622d86d1916699bd8a9badaaf98e8bfaec684a6958506a76da57f3939fe16a5",
@@ -40,7 +40,7 @@
       "static/css/studio.css": "4a15485657827b47cbb4312ffc303eb807dd3368517306a8a1ed0ed1dcfa48d1",
       "static/css/training.css": "09ae3826ffca317312a4c50ba351ef4022e778c585832cc160551f01a1b97e3f",
       "static/js/calibration.js": "c99f2b3aae6bd397d5846ba794b270db6ebcbf08898191a601e184125afa4395",
-      "static/js/panel.js": "28b7f896b80d4188e3614464ec11e204b8111bd16870e604a85b2e4098678b7c",
+      "static/js/panel.js": "5b070e550bb55764d7e7043341f7124702203f7a40dfd456a41757efa12a9935",
       "static/js/resource_updates.js": "89d9231cea751e6fea1e667e001e68b3477cba3776233cf0db1d8ab73c3caf08",
       "static/js/sessions.js": "398c75c1ec440454189f3387045f9d9241361f44596f8f81241f094939be4ee4",
       "static/js/studio.js": "7d5d3bfcf476eaaddcdbe427ac37f6cd8b56e0562594fba40d03620a34ac030d",
@@ -70,5 +70,5 @@
       "window_controller.py": "9310fa0a2dd828a1c8dae11128eddd43ff09d6c04f805466a398bec92ef1b628"
     }
   },
-  "signature": "5f6b7f27b5a360153af5f6da29db7232cd7aa3b0e47978cd9426b65e8a1691ff4a0f50c0bad976e28ba1890c5d4e453f842e8e794b43dac3d909340259c5c20b"
+  "signature": "1933c07ab34fd8ffe6ff9318349345ee6d47a4cc89d4d5c119023666f905116e0de105b4c099dc89a60a2e9e438002ff40acd8eb06b4e6f462e6162d8d09830e"
 }

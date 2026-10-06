@@ -555,9 +555,9 @@
                 : `Нужно ${needed} мин наблюдения, отсчётов: ${rate.samples}`;
         }
         const switchInput = grid.querySelector(`[data-switch-input="${cssEscape(key)}"]`);
-        const switchHint = grid.querySelector(`#switch-after-hint-${cssEscape(key)}`);
+        const switchHint = grid.querySelector(`[id="switch-after-hint-${cssEscape(key)}"]`);
         const sortSelect = grid.querySelector(`[data-sort-mode="${cssEscape(key)}"]`);
-        const sortHint = grid.querySelector(`#sort-mode-hint-${cssEscape(key)}`);
+        const sortHint = grid.querySelector(`[id="sort-mode-hint-${cssEscape(key)}"]`);
         if (sortSelect && !sortSelect.options.length) {
             SORT_MODES.forEach((mode) => {
                 const option = document.createElement('option');
